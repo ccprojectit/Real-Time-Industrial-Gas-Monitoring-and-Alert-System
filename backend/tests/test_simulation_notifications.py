@@ -1,0 +1,550 @@
+import asyncio
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+import sys
+import pytest
+from types import SimpleNamespace
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from app import main, notifications
+from app.security import current_operator
+from fastapi.testclient import TestClient
+
+
+@pytest.fixture(autouse=True)
+def disable_external_database_for_api_tests(monkeypatch):
+    async def no_database_connect():
+        return None
+
+    async def no_database_close():
+        return None
+
+    monkeypatch.setattr(main, "connect", no_database_connect)
+    monkeypatch.setattr(main, "close", no_database_close)
+    main.critical_simulation_last_trigger.clear()
+    yield
+    main.critical_simulation_last_trigger.clear()
+
+
+class MemoryConnection:
+    def __init__(self, active=None):
+        self.active = active
+        self.readings = []
+        self.created = []
+        self.executed = []
+
+    async def execute(self, sql, *args):
+        self.executed.append((sql, args))
+        if "INSERT INTO readings" in sql:
+            self.readings.append(args)
+
+    async def fetchval(self, sql, *args):
+        if "FROM notifications" in sql:
+            return None
+        raise AssertionError(sql)
+
+    async def fetchrow(self, sql, *args):
+        self.executed.append((sql, args))
+        if "SELECT * FROM incidents" in sql:
+            return self.active
+        if "INSERT INTO incidents" in sql:
+            self.active = {
+                "id": f"incident-{len(self.created) + 1}", "severity": args[3],
+                "reading": args[4], "unit": args[5], "warning_threshold_at_creation": args[6],
+                "critical_threshold_at_creation": args[7], "threshold": args[8],
+                "created_at": args[9], "critical_at": args[10], "gas_name": args[1],
+            }
+            self.created.append(self.active)
+            return self.active
+        if "UPDATE incidents SET severity" in sql:
+            self.active = {**self.active, "severity": "CRITICAL", "reading": args[0], "escalation_threshold": args[1]}
+            return self.active
+        raise AssertionError(sql)
+
+
+def test_critical_simulation_creates_one_incident_per_selected_zone(monkeypatch):
+    calls = []
+
+    async def no_sms(conn, incident, severity):
+        calls.append((incident, severity))
+
+    monkeypatch.setattr(main, "notify_incident", no_sms)
+    for zone_id, gas, formula, unit, warning, critical in [
+        (1, "Carbon Monoxide", "CO", "ppm", 35, 100),
+        (2, "Methane", "CH4", "% LEL", 10, 20),
+        (3, "Hydrogen Sulfide", "H2S", "ppm", 10, 20),
+        (4, "Ammonia", "NH3", "ppm", 25, 50),
+    ]:
+        async def run_one():
+            conn = MemoryConnection()
+            zone = {"id": zone_id, "name": f"Zone {zone_id}", "gas_name": gas, "formula": formula,
+                    "unit": unit, "warning_threshold": warning, "critical_threshold": critical}
+            await main.save_reading(conn, zone, critical * 1.08)
+            assert len(conn.readings) == 1
+            assert conn.created[0]["severity"] == "CRITICAL"
+            assert conn.created[0]["threshold"] == critical
+            assert conn.created[0]["warning_threshold_at_creation"] == warning
+            assert conn.created[0]["critical_threshold_at_creation"] == critical
+            assert any("INSERT INTO readings" in sql for sql, _ in conn.executed)
+            assert any("INSERT INTO incidents" in sql for sql, _ in conn.executed)
+
+        asyncio.run(run_one())
+    assert len(calls) == 4
+    assert all(severity == "CRITICAL" for _, severity in calls)
+
+
+def test_incident_deduplication_while_zone_condition_stays_active(monkeypatch):
+    calls = []
+
+    async def no_sms(conn, incident, severity):
+        calls.append((incident, severity))
+
+    monkeypatch.setattr(main, "notify_incident", no_sms)
+
+    async def run():
+        conn = MemoryConnection()
+        zone = {"id": 1, "name": "Zone 1", "gas_name": "Carbon Monoxide", "formula": "CO",
+                "unit": "ppm", "warning_threshold": 35, "critical_threshold": 100}
+        await main.save_reading(conn, zone, 101)
+        await main.save_reading(conn, zone, 105)
+        assert len(conn.created) == 1
+        assert len(calls) == 1
+
+    asyncio.run(run())
+
+
+def test_warning_incident_escalates_once_to_critical(monkeypatch):
+    calls = []
+
+    async def no_sms(conn, incident, severity):
+        calls.append((incident, severity))
+
+    monkeypatch.setattr(main, "notify_incident", no_sms)
+
+    async def run():
+        conn = MemoryConnection()
+        zone = {"id": 1, "name": "Zone 1", "gas_name": "Carbon Monoxide", "formula": "CO",
+                "unit": "ppm", "warning_threshold": 35, "critical_threshold": 100}
+        await main.save_reading(conn, zone, 40)
+        assert conn.created[0]["severity"] == "WARNING"
+        assert len(calls) == 1 and calls[0][1] == "WARNING"
+        await main.save_reading(conn, zone, 100)
+        assert conn.active["severity"] == "CRITICAL"
+        assert conn.active["threshold"] == 35
+        assert conn.active["escalation_threshold"] == 100
+        assert len(calls) == 2
+        assert calls[1][1] == "CRITICAL"
+
+    asyncio.run(run())
+
+
+class NotificationConnection:
+    def __init__(self):
+        self.saved = None
+
+    async def fetchval(self, *_):
+        return None
+
+    async def execute(self, sql, *args):
+        self.saved = args
+
+
+def test_mock_notification_never_sends_sms(monkeypatch):
+    monkeypatch.setattr(notifications.settings, "sms_enabled", False)
+    monkeypatch.setattr(notifications.settings, "sms_mode", "mock")
+    conn = NotificationConnection()
+    incident = {"id": "abc", "zone_name": "Zone 1", "gas_name": "Carbon Monoxide", "reading": 101,
+                "unit": "ppm", "created_at": datetime.now(timezone.utc)}
+    asyncio.run(notifications.notify_incident(conn, incident, "WARNING"))
+    assert conn.saved[0] == "abc"
+    assert conn.saved[1] == "WARNING"
+    assert conn.saved[2] == "mock"
+    assert conn.saved[3] == "MOCK_RECORDED"
+    assert "No SMS sent" in json.loads(conn.saved[6])["detail"]
+
+
+def test_provider_failure_is_saved_as_failed_without_retry(monkeypatch):
+    class Response:
+        is_success = False
+        status_code = 429
+        text = "rate limited"
+
+    class Client:
+        def __init__(self, **_): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): pass
+        async def post(self, *_args, **_kwargs): return Response()
+
+    monkeypatch.setattr(notifications.settings, "sms_enabled", True)
+    monkeypatch.setattr(notifications.settings, "sms_mode", "real")
+    for key, value in {
+        "exotel_account_sid": "sid", "exotel_api_key": "key", "exotel_api_token": "token",
+        "exotel_sender_id": "test-sender", "sms_recipient_number": "test-recipient",
+    }.items(): monkeypatch.setattr(notifications.settings, key, value)
+    monkeypatch.setattr(notifications.httpx, "AsyncClient", Client)
+    conn = NotificationConnection()
+    incident = {"id": "abc", "zone_name": "Zone 1", "gas_name": "Carbon Monoxide", "reading": 101,
+                "unit": "ppm", "created_at": datetime.now(timezone.utc)}
+    asyncio.run(notifications.notify_incident(conn, incident, "CRITICAL"))
+    assert conn.saved[2] == "real"
+    assert conn.saved[3] == "FAILED"
+    assert json.loads(conn.saved[6])["http_status"] == 429
+
+
+def test_warning_incident_notification_is_recorded_immediately(monkeypatch):
+    monkeypatch.setattr(notifications.settings, "sms_enabled", False)
+    monkeypatch.setattr(notifications.settings, "sms_mode", "mock")
+    conn = NotificationConnection()
+    incident = {"id": "warning-1", "zone_name": "Zone 2", "gas_name": "Methane", "reading": 11,
+                "unit": "% LEL", "created_at": datetime.now(timezone.utc)}
+    asyncio.run(notifications.notify_incident(conn, incident, "WARNING"))
+    assert conn.saved[1] == "WARNING"
+    assert conn.saved[2] == "mock"
+    assert conn.saved[3] == "MOCK_RECORDED"
+    assert "WARNING gas alert" in conn.saved[4]
+
+
+def test_critical_simulation_readings_remain_at_or_above_critical_threshold(monkeypatch):
+    zone = {"warning_threshold": 35, "critical_threshold": 100, "normal_min": 0, "normal_max": 12}
+    monkeypatch.setattr(main.random, "uniform", lambda _low, _high: -1.0)
+    for prior in (100.0, 108.0, 160.0):
+        next_reading = main.simulation_reading(zone, prior, critical_latched=True)
+        assert next_reading > prior
+        assert next_reading >= 100
+
+
+def test_critical_simulation_cooldown_returns_retry_after(monkeypatch):
+    monkeypatch.setattr(main.settings, "critical_simulation_cooldown_seconds", 5)
+    main.critical_simulation_last_trigger[1] = 100.0
+    with pytest.raises(main.HTTPException) as error:
+        main.check_critical_simulation_cooldown(1, 101.0)
+    assert error.value.status_code == 429
+    assert "4 seconds" in error.value.detail
+    main.check_critical_simulation_cooldown(1, 105.0)
+
+
+def test_development_no_auth_bypass_is_loopback_only(monkeypatch):
+    monkeypatch.setattr(main.settings, "app_env", "development")
+    monkeypatch.setattr(main.settings, "auth_required", False)
+    from starlette.requests import Request
+
+    local = Request({"type":"http", "method":"GET", "path":"/", "headers":[],
+                     "client":("127.0.0.1",1234), "server":("127.0.0.1",8000), "scheme":"http"})
+    remote = Request({"type":"http", "method":"GET", "path":"/", "headers":[],
+                      "client":("203.0.113.20",1234), "server":("127.0.0.1",8000), "scheme":"http"})
+
+    assert current_operator(local) == "Local demo operator"
+    with pytest.raises(main.HTTPException) as error:
+        current_operator(remote)
+    assert error.value.status_code == 503
+
+
+def test_remote_development_still_requires_a_signed_in_operator(monkeypatch):
+    monkeypatch.setattr(main.settings, "app_env", "development")
+    monkeypatch.setattr(main.settings, "auth_required", False)
+    monkeypatch.setattr(main.settings, "session_secret", "a-unique-test-session-secret-with-more-than-32-chars")
+    monkeypatch.setattr(main.settings, "admin_username", "project-operator")
+    monkeypatch.setattr(main.settings, "admin_password", "secure-test-password-with-32-chars")
+    from starlette.requests import Request
+    remote = Request({"type":"http", "method":"GET", "path":"/", "headers":[],
+                      "client":("203.0.113.20",1234), "server":("127.0.0.1",8000), "scheme":"http"})
+
+    with pytest.raises(main.HTTPException) as error:
+        current_operator(remote)
+    assert error.value.status_code == 401
+
+
+def test_websocket_rejects_untrusted_origin_before_accept():
+    class Socket:
+        headers = {"origin": "https://untrusted.example"}
+        closed = None
+
+        async def close(self, **kwargs):
+            self.closed = kwargs
+
+    socket = Socket()
+    asyncio.run(main.websocket_state(socket))
+    assert socket.closed["code"] == 1008
+
+
+def test_websocket_requires_a_session_for_remote_connections(monkeypatch):
+    monkeypatch.setattr(main.settings, "app_env", "production")
+    monkeypatch.setattr(main.settings, "auth_required", True)
+    monkeypatch.setattr(main.settings, "session_secret", "a-secure-test-secret-with-more-than-32-characters")
+    monkeypatch.setattr(main.settings, "admin_username", "project-operator")
+    monkeypatch.setattr(main.settings, "admin_password", "secure-test-password-with-32-chars")
+    monkeypatch.setattr(main.settings, "cors_origins", "https://dashboard.example")
+
+    class Socket:
+        headers = {"origin": "https://dashboard.example"}
+        client = SimpleNamespace(host="203.0.113.20", port=1234)
+        cookies = {}
+        closed = None
+
+        async def close(self, **kwargs):
+            self.closed = kwargs
+
+    socket = Socket()
+    asyncio.run(main.websocket_state(socket))
+    assert socket.closed["code"] == 1008
+
+
+def test_simulator_stops_after_configured_maximum_runtime(monkeypatch):
+    monkeypatch.setattr(main.settings, "simulator_max_runtime_seconds", 0.12)
+    monkeypatch.setattr(main.settings, "simulator_interval_seconds", 0.05)
+    monkeypatch.setattr(main, "simulator_enabled", True)
+
+    async def run():
+        main.simulator_task = asyncio.current_task()
+        await main.simulator_loop()
+
+    asyncio.run(run())
+    assert main.simulator_enabled is False
+    assert main.simulator_task is None
+
+
+def test_unauthenticated_local_demo_can_start_and_stop_simulation(monkeypatch):
+    monkeypatch.setattr(main.settings, "app_env", "development")
+    monkeypatch.setattr(main.settings, "auth_required", False)
+
+    async def no_broadcast():
+        return None
+
+    monkeypatch.setattr(main, "broadcast", no_broadcast)
+    with TestClient(main.app, client=("127.0.0.1", 1234)) as client:
+        assert client.get("/api/auth/session").json()["auth_required"] is False
+        assert client.get("/api/auth/session").json()["demo_reset_allowed"] is True
+        assert client.post("/api/simulation/start").status_code == 200
+        assert client.post("/api/simulation/stop").status_code == 200
+
+
+def test_operator_auth_required_and_simulator_start_stop(monkeypatch):
+    monkeypatch.setattr(main.settings, "admin_username", "operator-test")
+    monkeypatch.setattr(main.settings, "admin_password", "correct-horse")
+    monkeypatch.setattr(main.settings, "auth_required", True)
+
+    async def no_broadcast():
+        return None
+
+    monkeypatch.setattr(main, "broadcast", no_broadcast)
+    with TestClient(main.app, client=("127.0.0.1", 1234)) as client:
+        denied = client.post("/api/simulation/start")
+        assert denied.status_code == 401
+        signed_in = client.post("/api/auth/login", json={"username":"operator-test", "password":"correct-horse"})
+        assert signed_in.status_code == 200
+        assert client.get("/api/auth/session").json()["authenticated"] is True
+        started = client.post("/api/simulation/start")
+        assert started.status_code == 200
+        assert started.json()["simulator_running"] is True
+        stopped = client.post("/api/simulation/stop")
+        assert stopped.status_code == 200
+        assert stopped.json()["simulator_running"] is False
+        assert client.post("/api/auth/logout").status_code == 200
+        assert client.post("/api/simulation/start").status_code == 401
+
+
+def test_all_privileged_api_routes_require_authentication(monkeypatch):
+    monkeypatch.setattr(main.settings, "app_env", "development")
+    monkeypatch.setattr(main.settings, "auth_required", True)
+    with TestClient(main.app, client=("127.0.0.1", 1234)) as client:
+        assert client.put("/api/zones/1/thresholds", json={"warning_threshold":35,"critical_threshold":100}).status_code == 401
+        assert client.post("/api/simulation/critical", json={"zone_id":1}).status_code == 401
+        assert client.post("/api/demo/reset").status_code == 401
+        assert client.post("/api/incidents/event-1/acknowledge", json={"actor":"Operator"}).status_code == 401
+        assert client.post("/api/incidents/event-1/resolve", json={"actor":"Operator"}).status_code == 401
+
+
+def test_api_validation_rejects_invalid_login_and_critical_zone():
+    with TestClient(main.app, client=("127.0.0.1", 1234)) as client:
+        invalid_login = client.post("/api/auth/login", json={"username":"", "password":""})
+        assert invalid_login.status_code == 422
+        invalid_zone = client.post("/api/simulation/critical", json={"zone_id":5})
+        assert invalid_zone.status_code == 422
+
+
+def test_mutating_requests_reject_unlisted_browser_origins(monkeypatch):
+    monkeypatch.setattr(main.settings, "auth_required", True)
+    with TestClient(main.app, client=("127.0.0.1", 1234)) as client:
+        blocked = client.post("/api/simulation/start", headers={"Origin":"https://untrusted.example"})
+        assert blocked.status_code == 403
+        allowed_but_unauthenticated = client.post("/api/simulation/start", headers={"Origin":"http://localhost:5173"})
+        assert allowed_but_unauthenticated.status_code == 401
+
+
+def test_remote_production_mutations_require_an_allowed_origin(monkeypatch):
+    monkeypatch.setattr(main.settings, "app_env", "production")
+    monkeypatch.setattr(main.settings, "auth_required", True)
+    monkeypatch.setattr(main.settings, "database_url", "postgresql://example")
+    monkeypatch.setattr(main.settings, "session_secret", "a-unique-test-session-secret-with-more-than-32-chars")
+    monkeypatch.setattr(main.settings, "admin_username", "project-operator")
+    monkeypatch.setattr(main.settings, "admin_password", "strong-password-for-test")
+    monkeypatch.setattr(main.settings, "cors_origins", "https://dashboard.example")
+    with TestClient(main.app, client=("203.0.113.20", 1234)) as client:
+        no_origin = client.post("/api/simulation/start")
+        assert no_origin.status_code == 403
+        denied_session = client.post("/api/simulation/start", headers={"Origin":"https://dashboard.example"})
+        assert denied_session.status_code == 401
+
+
+def test_acknowledge_and_resolve_record_actor_without_touching_zone_state(monkeypatch):
+    class Tx:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return False
+
+    class Conn:
+        def __init__(self):
+            self.incident = {"id":"event-1", "state":"OPEN", "acknowledged_at":None,
+                             "acknowledged_by":None, "resolved_at":None, "resolved_by":None}
+            self.audit = []
+            self.statements = []
+        def transaction(self): return Tx()
+        async def fetchrow(self, sql, *args):
+            self.statements.append(sql)
+            if sql.startswith("UPDATE incidents SET"):
+                assert "zones" not in sql.lower()
+                column, state = ("acknowledged", "ACKNOWLEDGED") if "acknowledged_at" in sql else ("resolved", "RESOLVED")
+                self.incident.update({"state":state, f"{column}_at":"recorded", f"{column}_by":args[1]})
+                return dict(self.incident)
+            raise AssertionError(sql)
+        async def fetchval(self, *_): return None
+        async def execute(self, sql, *args): self.audit.append(args)
+
+    class Pool:
+        def __init__(self): self.conn = Conn()
+        def acquire(self): return self
+        async def __aenter__(self): return self.conn
+        async def __aexit__(self, *_): return False
+
+    pool = Pool()
+    monkeypatch.setattr(main, "require_pool", lambda: pool)
+
+    async def run():
+        ack = await main.change_incident("event-1", "operator-test", "acknowledge")
+        assert ack["state"] == "ACKNOWLEDGED"
+        assert ack["acknowledged_by"] == "operator-test"
+        resolved = await main.change_incident("event-1", "operator-test", "resolve")
+        assert resolved["state"] == "RESOLVED"
+        assert resolved["resolved_by"] == "operator-test"
+        assert resolved["acknowledged_at"] == "recorded"
+        assert len(pool.conn.audit) == 2
+
+    asyncio.run(run())
+
+
+def test_demo_reset_is_post_only_and_no_generic_delete_routes_are_registered():
+    paths = main.app.openapi()["paths"]
+    assert paths["/api/demo/reset"]["post"]
+    assert all("delete" not in methods for methods in paths.values())
+
+
+def test_demo_reset_clears_history_preserves_zones_and_audits(monkeypatch):
+    class Tx:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return False
+
+    class Conn:
+        def __init__(self): self.deleted = []; self.audit = []
+        def transaction(self): return Tx()
+        async def fetchval(self, sql):
+            self.deleted.append(sql)
+            return 2
+        async def execute(self, sql, *args): self.audit.append((sql, args))
+
+    class Pool:
+        def __init__(self): self.conn = Conn()
+        def acquire(self): return self
+        async def __aenter__(self): return self.conn
+        async def __aexit__(self, *_): return False
+
+    pool = Pool()
+    monkeypatch.setattr(main.settings, "app_env", "development")
+    monkeypatch.setattr(main, "current_operator", lambda _request: "demo-operator")
+    monkeypatch.setattr(main, "require_pool", lambda: pool)
+    monkeypatch.setattr(main, "broadcast", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(main, "simulator_enabled", False)
+    monkeypatch.setattr(main, "simulator_task", None)
+    from starlette.requests import Request
+    request = Request({"type":"http", "method":"POST", "path":"/api/demo/reset", "headers":[],
+                       "client":("127.0.0.1",1234), "server":("127.0.0.1",8000), "scheme":"http"})
+
+    result = asyncio.run(main.reset_demo_data(request))
+
+    assert ["notifications" in sql for sql in pool.conn.deleted] == [True, False, False]
+    assert all("DELETE FROM zones" not in sql for sql in pool.conn.deleted)
+    assert result["deleted"] == {"readings":2, "incidents":2, "notifications":2}
+    assert "thresholds" in result["preserved"]
+    assert len(pool.conn.audit) == 1
+    assert "RESET_DEMO_DATA" in pool.conn.audit[0][0]
+
+
+def test_demo_reset_is_unavailable_outside_development_and_test(monkeypatch):
+    monkeypatch.setattr(main.settings, "app_env", "production")
+    monkeypatch.setattr(main, "current_operator", lambda _request: "signed-in-operator")
+    from starlette.requests import Request
+    request = Request({"type":"http", "method":"POST", "path":"/api/demo/reset", "headers":[],
+                       "client":("127.0.0.1",1234), "server":("127.0.0.1",8000), "scheme":"http"})
+
+    try:
+        asyncio.run(main.reset_demo_data(request))
+    except main.HTTPException as exc:
+        assert exc.status_code == 404
+    else:
+        raise AssertionError("demo reset must be unavailable in production")
+
+
+def test_demo_reset_is_unavailable_to_remote_development_clients(monkeypatch):
+    monkeypatch.setattr(main.settings, "app_env", "development")
+    monkeypatch.setattr(main, "current_operator", lambda _request: "signed-in-operator")
+    from starlette.requests import Request
+    request = Request({"type":"http", "method":"POST", "path":"/api/demo/reset", "headers":[],
+                       "client":("203.0.113.20",1234), "server":("127.0.0.1",8000), "scheme":"http"})
+
+    with pytest.raises(main.HTTPException) as error:
+        asyncio.run(main.reset_demo_data(request))
+    assert error.value.status_code == 404
+
+
+def test_production_configuration_rejects_unsafe_defaults(monkeypatch):
+    monkeypatch.setattr(main.settings, "app_env", "production")
+    monkeypatch.setattr(main.settings, "database_url", "postgresql://example")
+    monkeypatch.setattr(main.settings, "session_secret", "development-only-change-this-secret")
+    monkeypatch.setattr(main.settings, "admin_username", "operator")
+    monkeypatch.setattr(main.settings, "admin_password", "strong-password-for-test")
+    monkeypatch.setattr(main.settings, "cors_origins", "https://dashboard.example")
+    try:
+        main.validate_production_configuration()
+    except RuntimeError as exc:
+        assert "SESSION_SECRET" in str(exc)
+    else:
+        raise AssertionError("unsafe default session secret must fail production validation")
+
+
+def test_production_configuration_accepts_explicit_secure_values(monkeypatch):
+    monkeypatch.setattr(main.settings, "app_env", "production")
+    monkeypatch.setattr(main.settings, "database_url", "postgresql://example")
+    monkeypatch.setattr(main.settings, "session_secret", "a-unique-test-session-secret-with-more-than-32-chars")
+    monkeypatch.setattr(main.settings, "admin_username", "project-operator")
+    monkeypatch.setattr(main.settings, "admin_password", "strong-password-for-test")
+    monkeypatch.setattr(main.settings, "auth_required", True)
+    monkeypatch.setattr(main.settings, "cors_origins", "https://dashboard.example")
+    main.validate_production_configuration()
+
+
+def test_production_configuration_rejects_unknown_environment(monkeypatch):
+    monkeypatch.setattr(main.settings, "app_env", "staging")
+    monkeypatch.setattr(main.settings, "auth_required", False)
+    with pytest.raises(RuntimeError, match="APP_ENV"):
+        main.validate_production_configuration()
+
+
+def test_production_configuration_rejects_authentication_bypass(monkeypatch):
+    monkeypatch.setattr(main.settings, "app_env", "production")
+    monkeypatch.setattr(main.settings, "auth_required", False)
+    monkeypatch.setattr(main.settings, "database_url", "postgresql://example")
+    monkeypatch.setattr(main.settings, "session_secret", "a-unique-test-session-secret-with-more-than-32-chars")
+    monkeypatch.setattr(main.settings, "admin_username", "project-operator")
+    monkeypatch.setattr(main.settings, "admin_password", "strong-password-for-test")
+    monkeypatch.setattr(main.settings, "cors_origins", "https://dashboard.example")
+    with pytest.raises(RuntimeError, match="AUTH_REQUIRED"):
+        main.validate_production_configuration()
