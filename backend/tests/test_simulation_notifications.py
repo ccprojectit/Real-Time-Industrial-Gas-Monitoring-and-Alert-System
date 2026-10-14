@@ -1,9 +1,11 @@
 import asyncio
+import copy
 import json
 from datetime import datetime, timezone
 from pathlib import Path
 import sys
 import pytest
+from pydantic import ValidationError
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -47,7 +49,7 @@ class MemoryConnection:
     async def fetchrow(self, sql, *args):
         self.executed.append((sql, args))
         if "SELECT * FROM incidents" in sql:
-            return self.active
+            return self.active if self.active and self.active.get("state") != "RESOLVED" else None
         if "INSERT INTO incidents" in sql:
             self.active = {
                 "id": f"incident-{len(self.created) + 1}", "severity": args[3],
@@ -60,7 +62,80 @@ class MemoryConnection:
         if "UPDATE incidents SET severity" in sql:
             self.active = {**self.active, "severity": "CRITICAL", "reading": args[0], "escalation_threshold": args[1]}
             return self.active
+        if "UPDATE incidents SET state='RESOLVED'" in sql:
+            self.active = {**self.active, "state": "RESOLVED", "resolved_at": args[0], "resolved_by": "Simulator recovery"}
+            return {"id": self.active["id"]}
         raise AssertionError(sql)
+
+
+class CriticalBatchConnection:
+    def __init__(self, fail_notification_number=None):
+        self.zones = [
+            {"id":1,"name":"Zone 1","gas_name":"Carbon Monoxide","formula":"CO","unit":"ppm","warning_threshold":35,"critical_threshold":100,"normal_min":0,"normal_max":12},
+            {"id":2,"name":"Zone 2","gas_name":"Methane","formula":"CH4","unit":"% LEL","warning_threshold":10,"critical_threshold":20,"normal_min":0,"normal_max":4},
+            {"id":3,"name":"Zone 3","gas_name":"Hydrogen Sulfide","formula":"H2S","unit":"ppm","warning_threshold":10,"critical_threshold":20,"normal_min":0,"normal_max":3},
+            {"id":4,"name":"Zone 4","gas_name":"Ammonia","formula":"NH3","unit":"ppm","warning_threshold":25,"critical_threshold":50,"normal_min":0,"normal_max":8},
+        ]
+        self.readings=[]; self.incidents=[]; self.notifications=[]; self.audit=[]
+        self.fail_notification_number=fail_notification_number; self.notification_attempts=0
+
+    class Tx:
+        def __init__(self, conn): self.conn=conn
+        async def __aenter__(self):
+            self.snapshot=copy.deepcopy((self.conn.readings,self.conn.incidents,self.conn.notifications,self.conn.audit))
+            return self
+        async def __aexit__(self, exc_type, *_):
+            if exc_type:
+                self.conn.readings,self.conn.incidents,self.conn.notifications,self.conn.audit=self.snapshot
+            return False
+
+    def transaction(self): return self.Tx(self)
+
+    async def fetch(self, sql, zone_ids):
+        if "FROM zones" not in sql: raise AssertionError(sql)
+        selected=set(zone_ids)
+        return [zone for zone in self.zones if zone["id"] in selected]
+
+    async def fetchval(self, sql, *args):
+        if "FROM notifications" in sql:
+            return next((n["id"] for n in self.notifications if n["incident_id"]==args[0] and n["event_severity"]==args[1]),None)
+        raise AssertionError(sql)
+
+    async def fetchrow(self, sql, *args):
+        if "SELECT * FROM incidents" in sql:
+            return next((i for i in self.incidents if i["zone_id"]==args[0] and i["state"]!="RESOLVED"),None)
+        if "INSERT INTO incidents" in sql:
+            incident={"id":f"incident-{len(self.incidents)+1}","zone_id":args[0],"gas_name":args[1],"formula":args[2],
+                "severity":args[3],"reading":args[4],"unit":args[5],"warning_threshold_at_creation":args[6],
+                "critical_threshold_at_creation":args[7],"threshold":args[8],"created_at":args[9],"critical_at":args[10],"state":"OPEN"}
+            self.incidents.append(incident)
+            return incident
+        if "UPDATE incidents SET severity" in sql:
+            incident=next(i for i in self.incidents if i["id"]==args[3])
+            incident.update({"severity":"CRITICAL","reading":args[0],"escalation_threshold":args[1],"critical_at":args[2]})
+            return incident
+        raise AssertionError(sql)
+
+    async def execute(self, sql, *args):
+        if "INSERT INTO readings" in sql:
+            self.readings.append({"zone_id":args[0],"value":args[1],"unit":args[2],"measured_at":args[3]})
+        elif "INSERT INTO notifications" in sql:
+            self.notification_attempts+=1
+            if self.fail_notification_number==self.notification_attempts:
+                raise RuntimeError("simulated notification persistence failure")
+            self.notifications.append({"id":f"notification-{len(self.notifications)+1}","incident_id":args[0],
+                "event_severity":args[1],"mode":args[2],"status":args[3],"message":args[4]})
+        elif "INSERT INTO audit_events" in sql:
+            self.audit.append((sql,args))
+        else:
+            raise AssertionError(sql)
+
+
+class CriticalBatchPool:
+    def __init__(self, conn): self.conn=conn
+    def acquire(self): return self
+    async def __aenter__(self): return self.conn
+    async def __aexit__(self, *_): return False
 
 
 def test_critical_simulation_creates_one_incident_per_selected_zone(monkeypatch):
@@ -105,9 +180,12 @@ def test_critical_api_persists_immediately_and_rejects_rapid_duplicate(monkeypat
 
         def transaction(self): return self.Tx()
 
+        async def fetch(self, sql, *args):
+            if "FROM zones" in sql:
+                return [zone]
+            raise AssertionError(sql)
+
         async def fetchrow(self, sql, *args):
-            if "SELECT * FROM zones" in sql:
-                return zone
             return await super().fetchrow(sql, *args)
 
     class Pool:
@@ -155,6 +233,93 @@ def test_critical_api_persists_immediately_and_rejects_rapid_duplicate(monkeypat
 
     asyncio.run(run())
     main.critical_simulation_last_trigger.clear()
+
+
+def hold_background_task_factory():
+    created=[]
+    def hold(coro):
+        coro.close()
+        created.append(object())
+        return created[-1]
+    return created,hold
+
+
+def test_multi_zone_critical_creates_records_only_for_selected_zones_and_deduplicates(monkeypatch):
+    conn=CriticalBatchConnection(); pool=CriticalBatchPool(conn); created,hold_task=hold_background_task_factory()
+    monkeypatch.setattr(main,"require_pool",lambda:pool)
+    monkeypatch.setattr(main,"current_operator",lambda _request:"signed-in-operator")
+    monkeypatch.setattr(main.asyncio,"create_task",hold_task)
+    monkeypatch.setattr(main,"simulator_enabled",False); monkeypatch.setattr(main,"simulator_task",None)
+    monkeypatch.setattr(main.settings,"critical_simulation_cooldown_seconds",5)
+    monkeypatch.setattr(main,"broadcast",lambda:asyncio.sleep(0))
+    from starlette.requests import Request
+    request=Request({"type":"http","method":"POST","path":"/api/simulation/critical/batch","headers":[],
+                     "client":("203.0.113.20",1234),"server":("127.0.0.1",8000),"scheme":"https"})
+
+    async def run():
+        result=await main.critical_simulation_batch(main.SimulationCriticalBatchRequest(zone_ids=[1,3]),request)
+        assert result["simulator_running"] is True
+        assert {item["zone_id"] for item in result["zones"]}=={1,3}
+        assert len(conn.readings)==len(conn.incidents)==len(conn.notifications)==2
+        for reading in conn.readings:
+            zone=next(z for z in conn.zones if z["id"]==reading["zone_id"])
+            assert reading["value"]>zone["critical_threshold"]
+        assert {item["zone_id"] for item in conn.readings}=={1,3}
+        assert all(item["status"]=="MOCK_RECORDED" and item["mode"]=="mock" for item in conn.notifications)
+        assert len(created)==2  # one simulator task and one WebSocket broadcast
+        with pytest.raises(main.HTTPException) as repeated:
+            await main.critical_simulation_batch(main.SimulationCriticalBatchRequest(zone_ids=[1,3]),request)
+        assert repeated.value.status_code==429
+        assert len(conn.readings)==len(conn.incidents)==len(conn.notifications)==2
+
+    asyncio.run(run())
+    main.critical_simulation_last_trigger.clear()
+
+
+def test_multi_zone_critical_all_four_zones_and_request_validation(monkeypatch):
+    conn=CriticalBatchConnection(); pool=CriticalBatchPool(conn); _,hold_task=hold_background_task_factory()
+    monkeypatch.setattr(main,"require_pool",lambda:pool)
+    monkeypatch.setattr(main,"current_operator",lambda _request:"signed-in-operator")
+    monkeypatch.setattr(main.asyncio,"create_task",hold_task)
+    monkeypatch.setattr(main,"simulator_enabled",False); monkeypatch.setattr(main,"simulator_task",None)
+    monkeypatch.setattr(main,"broadcast",lambda:asyncio.sleep(0))
+    from starlette.requests import Request
+    request=Request({"type":"http","method":"POST","path":"/api/simulation/critical/batch","headers":[],
+                     "client":("127.0.0.1",1234),"server":("127.0.0.1",8000),"scheme":"http"})
+
+    async def run():
+        result=await main.critical_simulation_batch(main.SimulationCriticalBatchRequest(zone_ids=[1,2,3,4]),request)
+        assert len(result["zones"])==4
+        assert {i["zone_id"] for i in conn.readings}=={1,2,3,4}
+        assert len(conn.incidents)==len(conn.notifications)==4
+        for reading in conn.readings:
+            zone=next(z for z in conn.zones if z["id"]==reading["zone_id"])
+            assert reading["value"]>zone["critical_threshold"]
+        with pytest.raises(main.HTTPException) as invalid:
+            await main.critical_simulation_for_zones([99],"signed-in-operator")
+        assert invalid.value.status_code==422
+        assert len(conn.readings)==4
+
+    with pytest.raises(ValidationError):
+        main.SimulationCriticalBatchRequest(zone_ids=[])
+    with pytest.raises(ValidationError):
+        main.SimulationCriticalBatchRequest(zone_ids=[1,1])
+    asyncio.run(run())
+    main.critical_simulation_last_trigger.clear()
+
+
+def test_multi_zone_critical_transaction_rolls_back_on_notification_failure(monkeypatch):
+    conn=CriticalBatchConnection(fail_notification_number=2); pool=CriticalBatchPool(conn); _,hold_task=hold_background_task_factory()
+    monkeypatch.setattr(main,"require_pool",lambda:pool)
+    monkeypatch.setattr(main.asyncio,"create_task",hold_task)
+    monkeypatch.setattr(main,"simulator_enabled",False); monkeypatch.setattr(main,"simulator_task",None)
+    async def run():
+        with pytest.raises(RuntimeError,match="notification persistence failure"):
+            await main.critical_simulation_for_zones([1,2],"signed-in-operator")
+    asyncio.run(run())
+    assert conn.readings==[] and conn.incidents==[] and conn.notifications==[] and conn.audit==[]
+    assert main.critical_simulation_last_trigger=={}
+    assert main.simulator_enabled is False
 
 
 def test_repeated_start_requests_create_only_one_simulator_task(monkeypatch):
@@ -230,6 +395,24 @@ def test_incident_deduplication_while_zone_condition_stays_active(monkeypatch):
     asyncio.run(run())
 
 
+def test_warning_crossing_creates_one_incident_and_mock_notification(monkeypatch):
+    notified=[]
+    async def record_mock(_conn, incident, severity):
+        notified.append((incident["id"],severity))
+    monkeypatch.setattr(main,"notify_incident",record_mock)
+
+    async def run():
+        conn=MemoryConnection()
+        zone={"id":1,"name":"Zone 1","gas_name":"Carbon Monoxide","formula":"CO","unit":"ppm",
+              "warning_threshold":35,"critical_threshold":100}
+        await main.save_reading(conn,zone,36)
+        await main.save_reading(conn,zone,37)
+        assert len(conn.created)==1
+        assert conn.created[0]["severity"]=="WARNING"
+        assert notified==[(conn.created[0]["id"],"WARNING")]
+    asyncio.run(run())
+
+
 def test_warning_incident_escalates_once_to_critical(monkeypatch):
     calls = []
 
@@ -288,13 +471,50 @@ def test_warning_and_critical_incidents_create_mock_records_without_network(monk
     assert "Mock only; no SMS sent" in json.loads(conn.saved[6])["detail"]
 
 
-def test_critical_simulation_readings_remain_at_or_above_critical_threshold(monkeypatch):
-    zone = {"warning_threshold": 35, "critical_threshold": 100, "normal_min": 0, "normal_max": 12}
-    monkeypatch.setattr(main.random, "uniform", lambda _low, _high: -1.0)
-    for prior in (100.0, 108.0, 160.0):
-        next_reading = main.simulation_reading(zone, prior, critical_latched=True)
-        assert next_reading > prior
-        assert next_reading >= 100
+@pytest.mark.parametrize("zone", [
+    {"warning_threshold":35,"critical_threshold":100,"normal_min":0,"normal_max":12},
+    {"warning_threshold":10,"critical_threshold":20,"normal_min":0,"normal_max":4},
+    {"warning_threshold":10,"critical_threshold":20,"normal_min":0,"normal_max":3},
+    {"warning_threshold":25,"critical_threshold":50,"normal_min":0,"normal_max":8},
+    {"warning_threshold":19.9995,"critical_threshold":20,"normal_min":0,"normal_max":19.9},
+])
+def test_automatic_simulation_samples_never_reach_critical(zone, monkeypatch):
+    monkeypatch.setattr(main.random, "random", lambda: 1.0)
+    monkeypatch.setattr(main.random, "uniform", lambda low, high: (low + high) / 2)
+    for prior in (None, zone["normal_max"] * 0.4):
+        reading = main.simulation_reading(zone, prior)
+        assert zone["normal_min"] <= reading <= zone["normal_max"]
+        assert reading < zone["warning_threshold"]
+    for prior in (zone["warning_threshold"], zone["critical_threshold"] * 1.08):
+        reading=main.simulation_reading(zone,prior)
+        assert zone["normal_min"] <= reading < zone["critical_threshold"]
+
+
+@pytest.mark.parametrize("zone", [
+    {"warning_threshold":35,"critical_threshold":100,"normal_min":0,"normal_max":12},
+    {"warning_threshold":10,"critical_threshold":20,"normal_min":0,"normal_max":4},
+    {"warning_threshold":10,"critical_threshold":20,"normal_min":0,"normal_max":3},
+    {"warning_threshold":25,"critical_threshold":50,"normal_min":0,"normal_max":8},
+    {"warning_threshold":19.9995,"critical_threshold":20,"normal_min":0,"normal_max":19.9},
+])
+def test_automatic_simulation_can_enter_warning_but_stays_below_critical(zone, monkeypatch):
+    monkeypatch.setattr(main.random, "random", lambda: 0.0)
+    monkeypatch.setattr(main.random, "uniform", lambda low, high: high)
+    reading = main.simulation_reading(zone, zone["normal_max"])
+    assert zone["warning_threshold"] <= reading < zone["critical_threshold"]
+
+
+def test_warning_recovery_resolves_only_the_warning_incident(monkeypatch):
+    async def run():
+        conn = MemoryConnection(active={"id":"warning-1","severity":"WARNING","state":"OPEN"})
+        zone = {"id":1,"name":"Zone 1","gas_name":"Carbon Monoxide","formula":"CO","unit":"ppm",
+                "warning_threshold":35,"critical_threshold":100}
+        await main.save_reading(conn, zone, 10, recover_warning=True)
+        assert conn.active["state"] == "RESOLVED"
+        assert conn.active["resolved_by"] == "Simulator recovery"
+        assert any("AUTO_RECOVERY" in sql for sql, _ in conn.executed)
+
+    asyncio.run(run())
 
 
 def test_critical_simulation_cooldown_returns_retry_after(monkeypatch):
@@ -391,7 +611,7 @@ def test_simulator_batches_zone_readings_in_one_database_write(monkeypatch):
     zones = [
         {"id": zone_id, "name": f"Zone {zone_id}", "gas_name": "Gas", "unit": "ppm",
          "warning_threshold": 50, "critical_threshold": 100, "normal_min": 0, "normal_max": 20,
-         "prior_reading": 5, "critical_latched": False}
+         "prior_reading": 5, "active_incident_severity": None}
         for zone_id in range(1, 5)
     ]
 
@@ -417,6 +637,7 @@ def test_simulator_batches_zone_readings_in_one_database_write(monkeypatch):
     monkeypatch.setattr(main, "simulator_enabled", True)
     monkeypatch.setattr(main, "simulator_task", None)
     monkeypatch.setattr(main, "broadcast", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(main.random, "random", lambda: 1.0)
 
     async def end_after_one_cycle(_delay):
         main.simulator_enabled = False
@@ -426,6 +647,7 @@ def test_simulator_batches_zone_readings_in_one_database_write(monkeypatch):
 
     assert len(pool.conn.batch) == 4
     assert {row[0] for row in pool.conn.batch} == {1, 2, 3, 4}
+    assert all(row[1] < 50 for row in pool.conn.batch)
 
 
 def test_unauthenticated_local_demo_can_start_and_stop_simulation(monkeypatch):
@@ -455,6 +677,8 @@ def test_operator_auth_required_and_simulator_start_stop(monkeypatch):
     with TestClient(main.app, client=("127.0.0.1", 1234)) as client:
         denied = client.post("/api/simulation/start")
         assert denied.status_code == 401
+        invalid_credentials = client.post("/api/auth/login", json={"username":"operator-test", "password":"incorrect-password"})
+        assert invalid_credentials.status_code == 401
         signed_in = client.post("/api/auth/login", json={"username":"operator-test", "password":"correct-horse"})
         assert signed_in.status_code == 200
         assert client.get("/api/auth/session").json()["authenticated"] is True
@@ -474,6 +698,7 @@ def test_all_privileged_api_routes_require_authentication(monkeypatch):
     with TestClient(main.app, client=("127.0.0.1", 1234)) as client:
         assert client.put("/api/zones/1/thresholds", json={"warning_threshold":35,"critical_threshold":100}).status_code == 401
         assert client.post("/api/simulation/critical", json={"zone_id":1}).status_code == 401
+        assert client.post("/api/simulation/critical/batch", json={"zone_ids":[1,3]}).status_code == 401
         assert client.post("/api/demo/reset").status_code == 401
         assert client.post("/api/incidents/event-1/acknowledge", json={"actor":"Operator"}).status_code == 401
         assert client.post("/api/incidents/event-1/resolve", json={"actor":"Operator"}).status_code == 401

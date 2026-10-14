@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Activity, AlertTriangle, Bell, Check, ChevronDown, Clock3, Flame, Gauge, LockKeyhole, LogIn, LogOut, Radio, RotateCcw, ShieldCheck, Siren, TriangleAlert, Wind, X } from 'lucide-react'
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import { calculateDashboardSummary } from './dashboardSummary.mjs'
+import { canOperateWithSession, isUnauthorizedStatus } from './authState.mjs'
 
 const API = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').replace(/\/$/, '')
 class ApiError extends Error { constructor(message:string,readonly status:number){super(message);this.name='ApiError'} }
@@ -20,11 +21,11 @@ async function api<T>(path:string, options:RequestInit = {}):Promise<T> {
 }
 const dateTime = (s:string|null|undefined) => s ? new Date(s).toLocaleString(undefined,{dateStyle:'medium',timeStyle:'short'}) : '—'
 const shortTime = (s:string) => new Date(s).toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit',second:'2-digit'})
-const notificationLabel = (status:string) => status==='MOCK_RECORDED' ? 'LOGGED' : status.replaceAll('_',' ')
+const notificationLabel = (status:string) => status==='MOCK_RECORDED' ? 'MOCK ALERT RECORDED' : status.replaceAll('_',' ')
 
 export default function App() {
   const [state,setState]=useState<State>({zones:[],readings:[],incidents:[],notifications:[],simulator:false,authenticated:false,authRequired:true,demoResetAllowed:false,health:'connecting'})
-  const [chartZone,setChartZone]=useState<number>(1), [criticalZone,setCriticalZone]=useState<number>(1)
+  const [chartZone,setChartZone]=useState<number>(1), [criticalZones,setCriticalZones]=useState<number[]>([])
   const [busy,setBusy]=useState(''), [error,setError]=useState(''), [success,setSuccess]=useState('')
   const [loginOpen,setLoginOpen]=useState(false), [loginName,setLoginName]=useState(''), [loginPassword,setLoginPassword]=useState(''), [loginBusy,setLoginBusy]=useState(false), [loginError,setLoginError]=useState('')
   const [now,setNow]=useState(new Date())
@@ -91,7 +92,7 @@ export default function App() {
     }catch{/* Ignore malformed frames and keep the fallback poll available. */}};socket.onclose=()=>{wsConnected.current=false;retry=window.setTimeout(connect,3000)};socket.onerror=()=>socket?.close()}
     connect();return()=>{wsConnected.current=false;clearTimeout(retry);socket?.close()}
   },[refresh,refreshHistory,state.authRequired,state.authenticated])
-  const canOperate=!state.authRequired||state.authenticated
+  const canOperate=canOperateWithSession({auth_required:state.authRequired,authenticated:state.authenticated})
   const action=async(key:string,path:string,body?:unknown)=>{
     setBusy(key);setError('');setSuccess('')
     try {
@@ -107,21 +108,27 @@ export default function App() {
       } else if(path==='/api/simulation/start'||path==='/api/simulation/stop'){
         setState(s=>({...s,simulator:!!result.simulator_running}))
         setSuccess(result.simulator_running?'Simulation started.':'Simulation stopped.')
-      } else if(path==='/api/simulation/critical'){
-        const zone=zonesRef.current.find(z=>z.id===result.zone_id)
-        if(zone&&result.measured_at){
-          setChartZone(Number(result.zone_id))
-          const reading:Reading={id:Date.parse(result.measured_at),zone_id:zone.id,zone_name:zone.name,gas_name:zone.gas_name,value:Number(result.reading),unit:zone.unit,measured_at:result.measured_at}
-          const updated={...zone,current_reading:Number(result.reading),previous_reading:zone.current_reading,last_updated:result.measured_at,status:result.status,active_incident_id:zone.active_incident_id}
-          zonesRef.current=zonesRef.current.map(item=>item.id===zone.id?updated:item)
-          setState(s=>({...s,zones:s.zones.map(item=>item.id===zone.id?updated:item),readings:[...s.readings.filter(item=>!(item.zone_id===reading.zone_id&&item.measured_at===reading.measured_at)),reading].slice(-1000),simulator:true}))
+      } else if(path==='/api/simulation/critical'||path==='/api/simulation/critical/batch'){
+        const events=path.endsWith('/batch')?(result.zones as Array<{zone_id:number;reading:number;status:string;measured_at:string}>):[result as {zone_id:number;reading:number;status:string;measured_at:string}]
+        if(events.length){
+          setChartZone(Number(events[0].zone_id))
+          const updates=new Map<number,Zone>()
+          const readings:Reading[]=[]
+          for(const event of events){
+            const zone=zonesRef.current.find(z=>z.id===event.zone_id)
+            if(!zone)continue
+            readings.push({id:Date.parse(event.measured_at),zone_id:zone.id,zone_name:zone.name,gas_name:zone.gas_name,value:Number(event.reading),unit:zone.unit,measured_at:event.measured_at})
+            updates.set(zone.id,{...zone,current_reading:Number(event.reading),previous_reading:zone.current_reading,last_updated:event.measured_at,status:event.status})
+          }
+          zonesRef.current=zonesRef.current.map(zone=>updates.get(zone.id)||zone)
+          setState(s=>({...s,zones:s.zones.map(zone=>updates.get(zone.id)||zone),readings:[...s.readings.filter(item=>!readings.some(reading=>reading.zone_id===item.zone_id&&reading.measured_at===item.measured_at)),...readings].slice(-1000),simulator:path.endsWith('/batch')?!!result.simulator_running:true}))
         }
         void refreshHistory()
-        setSuccess('Critical reading recorded.')
+        setSuccess(`Critical event recorded for ${events.length} ${events.length===1?'zone':'zones'}.`)
       }
     } catch(e) {
       const message=e instanceof Error?e.message:'Action failed'
-      if(e instanceof ApiError&&e.status===401)setState(s=>({...s,authenticated:false,authRequired:true}))
+      if(e instanceof ApiError&&isUnauthorizedStatus(e.status)){setState(s=>({...s,authenticated:false,authRequired:true}));setLoginPassword('');setLoginError(message);setLoginOpen(true)}
       setError(message)
     } finally {setBusy('')}
   }
@@ -134,17 +141,23 @@ export default function App() {
     setLoginBusy(true);setLoginError('');setError('')
     try{
       await api<{authenticated:boolean}>('/api/auth/login',{method:'POST',body:JSON.stringify({username:loginName,password:loginPassword})})
-      const session=await api<{authenticated:boolean}>('/api/auth/session')
+      const session=await api<{authenticated:boolean;auth_required:boolean;demo_reset_allowed:boolean}>('/api/auth/session')
       if(!session.authenticated)throw new Error('The backend did not confirm an operator session. Check the production session-cookie settings and try again.')
-      const refreshed=await refresh()
-      if(!refreshed)throw new Error('Sign-in succeeded, but the dashboard could not confirm the operator session. Please try again.')
+      setState(s=>({...s,authenticated:true,authRequired:session.auth_required,demoResetAllowed:session.demo_reset_allowed}))
       setLoginPassword('');setLoginOpen(false);setSuccess('Operator session confirmed. Controls are ready.')
+      void refresh()
     }catch(e){setLoginError(e instanceof Error?e.message:'Unable to sign in. Check the backend connection and try again.')}
     finally{setLoginBusy(false)}
   }
   const signOut=async()=>{
     setBusy('logout');setError('');setSuccess('')
-    try{await api('/api/auth/logout',{method:'POST'});const refreshed=await refresh();if(!refreshed)throw new Error('Signed out, but the dashboard could not refresh its session state.');setSuccess('Operator signed out.')}
+    try{
+      await api<{authenticated:boolean}>('/api/auth/logout',{method:'POST'})
+      const session=await api<{authenticated:boolean;auth_required:boolean;demo_reset_allowed:boolean}>('/api/auth/session')
+      if(session.authenticated)throw new Error('The backend still reports an active session. Please retry sign out.')
+      setState(s=>({...s,authenticated:false,authRequired:session.auth_required,demoResetAllowed:session.demo_reset_allowed}))
+      setLoginName('');setLoginPassword('');setLoginError('');setLoginOpen(true)
+    }
     catch(e){setError(e instanceof Error?e.message:'Unable to sign out.')}
     finally{setBusy('')}
   }
@@ -161,7 +174,7 @@ export default function App() {
       <section className="summary-strip"><div className="summary-item"><span className="summary-icon slate"><Radio size={17}/></span><div><strong>{state.zones.length||'—'}</strong><span>Zones monitored</span></div></div><div className="summary-item"><span className="summary-icon green"><ShieldCheck size={17}/></span><div><strong>{summary.normal}</strong><span>Normal zones</span></div></div><div className="summary-item"><span className="summary-icon amber"><AlertTriangle size={17}/></span><div><strong>{summary.warning}</strong><span>Warning zones</span></div></div><div className="summary-item"><span className="summary-icon red"><Siren size={17}/></span><div><strong>{summary.critical}</strong><span>Critical zones</span></div></div><div className="summary-item"><span className="summary-icon blue"><Bell size={17}/></span><div><strong>{summary.openIncidents}</strong><span>Open incidents</span></div></div></section>
       <section className="section-heading"><div><h3>Monitoring zones</h3></div></section>
       <section className="zone-grid">{state.zones.length===0?<div className="empty-panel">{state.health==='disconnected'?'Waiting for backend connection. Start the API and configure the database.':'Loading zone configuration…'}</div>:state.zones.map(zone=><ZoneCard key={zone.id} zone={zone}/>)}</section>
-      <section className="control-panel"><div className="control-copy"><div className="control-icon"><Gauge size={18}/></div><div><h3>Simulation controls</h3><p className="muted">Start or stop readings across all zones, or trigger a critical event for one zone.</p></div></div><div className="control-actions"><button className="btn btn-primary" disabled={!canOperate||!!busy||state.simulator} onClick={()=>requestAction('start','/api/simulation/start')}><Activity size={16}/>{busy==='start'?'Starting…':'Start simulation'}</button><button className="btn btn-outline" disabled={!canOperate||!!busy||!state.simulator} onClick={()=>requestAction('stop','/api/simulation/stop')}><span className="stop-square"/>{busy==='stop'?'Stopping…':'Stop simulation'}</button><div className="critical-action"><select aria-label="Critical simulation zone" value={criticalZone} onChange={e=>setCriticalZone(Number(e.target.value))}>{state.zones.map(z=><option key={z.id} value={z.id}>{z.name} · {z.formula}</option>)}</select><button className="btn btn-danger" disabled={!canOperate||!!busy||!state.zones.length} onClick={()=>requestAction('critical','/api/simulation/critical',{zone_id:criticalZone})}><Siren size={16}/>{busy==='critical'?'Triggering…':'Critical simulation'}</button></div><button className="btn btn-light reset-button" disabled={!canOperate||!!busy||!state.zones.length} onClick={confirmDemoReset}><RotateCcw size={15}/>{busy==='reset'?'Resetting…':'Reset All Data'}</button></div>{!canOperate&&<div className="access-note">Live monitoring is available. Operator controls require an authorized session.<button className="text-button access-action" onClick={()=>{setLoginError('');setLoginOpen(true)}}><LogIn size={14}/>Sign in to unlock controls</button></div>}</section>
+      <section className="control-panel"><div className="control-copy"><div className="control-icon"><Gauge size={18}/></div><div><h3>Simulation controls</h3><p className="muted">Start or stop readings across all zones, or trigger critical events for selected zones.</p></div></div><div className="control-actions"><button className="btn btn-primary" disabled={!canOperate||!!busy||state.simulator} onClick={()=>requestAction('start','/api/simulation/start')}><Activity size={16}/>{busy==='start'?'Starting…':'Start simulation'}</button><button className="btn btn-outline" disabled={!canOperate||!!busy||!state.simulator} onClick={()=>requestAction('stop','/api/simulation/stop')}><span className="stop-square"/>{busy==='stop'?'Stopping…':'Stop simulation'}</button><button className="btn btn-light reset-button" disabled={!canOperate||!!busy||!state.zones.length} onClick={confirmDemoReset}><RotateCcw size={15}/>{busy==='reset'?'Resetting…':'Reset All Data'}</button><div className="critical-action"><div className="critical-zone-picker"><div className="critical-zone-picker-head"><strong>Select critical simulation zones</strong><span>{criticalZones.length} selected</span><button type="button" className="text-button" disabled={!state.zones.length||!!busy} onClick={()=>setCriticalZones(criticalZones.length===state.zones.length?[]:state.zones.map(zone=>zone.id))}>{criticalZones.length===state.zones.length?'Clear selection':'Select all'}</button></div><div className="critical-zone-list">{state.zones.map(zone=><label key={zone.id} className="critical-zone-option"><input type="checkbox" checked={criticalZones.includes(zone.id)} disabled={!!busy} onChange={e=>setCriticalZones(selected=>e.target.checked?[...new Set([...selected,zone.id])]:selected.filter(id=>id!==zone.id))}/><span><strong>{zone.name}</strong><small>{zone.gas_name} ({zone.formula})</small></span></label>)}</div>{criticalZones.length===0&&<span className="critical-validation">Select at least one zone to trigger a critical simulation.</span>}</div><button className="btn btn-danger" disabled={!canOperate||!!busy||!criticalZones.length} onClick={()=>requestAction('critical','/api/simulation/critical/batch',{zone_ids:criticalZones})}><Siren size={16}/>{busy==='critical'?'Triggering…':'Trigger Critical for Selected Zones'}</button></div></div>{!canOperate&&<div className="access-note">Live monitoring is available. Operator controls require an authorized session.<button className="text-button access-action" onClick={()=>{setLoginError('');setLoginOpen(true)}}><LogIn size={14}/>Sign in to unlock controls</button></div>}</section>
       <section className="content-grid"><div className="panel chart-panel"><div className="panel-head"><div><h3>Reading history</h3><p className="muted">Recent concentration readings for the selected zone</p></div><label className="select-wrap"><select value={chartZone} onChange={e=>setChartZone(Number(e.target.value))}>{state.zones.map(z=><option key={z.id} value={z.id}>{z.name} · {z.formula}</option>)}</select><ChevronDown size={14}/></label></div><div className="chart-meta"><span><span className="legend-dot"/> {selectedZone?.gas_name||'Gas'} concentration</span><span>Unit: <strong>{selectedZone?.unit||'—'}</strong></span></div><div className="chart-area">{chart.length===0?<div className="chart-empty"><Activity size={21}/><span>{state.simulator?'Waiting for the first reading…':'No readings yet. Start the simulation to generate history.'}</span></div>:<ResponsiveContainer width="100%" height="100%"><LineChart data={chart} margin={{top:10,right:12,left:0,bottom:0}}><CartesianGrid stroke="#edf0f4" vertical={false}/><XAxis dataKey="time" tick={{fontSize:10,fill:'#8993a2'}} tickLine={false} axisLine={false} minTickGap={35}/><YAxis tick={{fontSize:10,fill:'#8993a2'}} tickLine={false} axisLine={false} width={42}/><Tooltip contentStyle={{border:'1px solid #e7ebf0',borderRadius:8,fontSize:12}} formatter={(v)=>[`${v} ${selectedZone?.unit||''}`,'Reading']}/><Line dataKey="value" type="monotone" stroke="#3275c7" strokeWidth={2.5} dot={{r:2.5,fill:'#3275c7',strokeWidth:0}} activeDot={{r:4}} isAnimationActive={false}/></LineChart></ResponsiveContainer>}</div><div className="chart-footer"><span><span className="tiny-line"/> Reading</span><span><span className="tiny-dash warning-line"/> Warning threshold {selectedZone?.warning_threshold??'—'} {selectedZone?.unit}</span><span><span className="tiny-dash critical-line"/> Critical threshold {selectedZone?.critical_threshold??'—'} {selectedZone?.unit}</span></div></div>
       <div className="panel notification-panel"><div className="panel-head"><div><h3>Notification history</h3><p className="muted">Warning and critical event notifications</p></div><span className="panel-count">{state.notifications.length}</span></div>{state.notifications.length===0?<div className="empty-state"><span className="empty-icon"><Bell size={19}/></span><strong>No notifications yet</strong><span>Incident alerts will appear here.</span></div>:<div className="notification-list">{state.notifications.slice(0,8).map(n=><div className="notification-row" key={n.id}><span className="notif-icon mock"><Bell size={15}/></span><div className="notif-main"><div className="notif-title"><strong>{n.zone_name} · {n.gas_name} · {n.event_severity}</strong><span className={`notif-status ${n.status==='FAILED'?'failed':''}`}>{notificationLabel(n.status)}</span></div><p>{n.reading} {n.unit} <span>·</span> {dateTime(n.created_at)}</p><small className="notif-message">{n.message}</small></div></div>)}</div>}</div></section>
       <section className="panel incidents-panel"><div className="panel-head"><div><h3>Incident history</h3><p className="muted">Review events and record operator actions.</p></div><span className="panel-count">{state.incidents.length} records</span></div>{state.incidents.length===0?<div className="incident-empty"><ShieldCheck size={18}/><span>No incidents recorded. Zone events will be listed here.</span></div>:<div className="table-scroll"><table><thead><tr><th>ZONE / GAS</th><th>SEVERITY</th><th>READING</th><th>THRESHOLD</th><th>CREATED</th><th>STATE</th><th>NOTIFICATION</th><th>ACTIONS</th></tr></thead><tbody>{state.incidents.map(i=><tr key={i.incident_id}><td><strong>{i.zone_name}</strong><span className="table-sub">{i.gas_name} ({i.formula})</span></td><td><span className={`severity-tag ${i.severity.toLowerCase()}`}><span/>{i.severity}</span></td><td><strong>{i.reading}</strong> <span className="muted">{i.unit}</span></td><td>{i.display_threshold} <span className="muted">{i.unit}</span></td><td>{dateTime(i.created_at)}</td><td><span className={`state-tag ${i.state.toLowerCase()}`}>{i.state}</span>{i.acknowledged_at&&<span className="table-sub">Acknowledged {dateTime(i.acknowledged_at)}</span>}{i.resolved_at&&<span className="table-sub">Resolved {dateTime(i.resolved_at)}</span>}</td><td>{i.notification_status?<span className={`notif-status ${i.notification_status==='FAILED'?'failed':''}`}>{notificationLabel(i.notification_status)}</span>:<span className="muted">—</span>}</td><td><div className="row-actions"><button className="text-button" disabled={!canOperate||i.state!=='OPEN'||!!busy} onClick={()=>requestAction(`ack-${i.incident_id}`,`/api/incidents/${i.incident_id}/acknowledge`,{actor:'Operator'})}><Check size={13}/>{busy===`ack-${i.incident_id}`?'Saving…':' Acknowledge'}</button><button className="text-button resolve" disabled={!canOperate||i.state==='RESOLVED'||!!busy} onClick={()=>requestAction(`res-${i.incident_id}`,`/api/incidents/${i.incident_id}/resolve`,{actor:'Operator'})}><ShieldCheck size={13}/>{busy===`res-${i.incident_id}`?'Saving…':' Resolve'}</button></div></td></tr>)}</tbody></table></div>}</section>

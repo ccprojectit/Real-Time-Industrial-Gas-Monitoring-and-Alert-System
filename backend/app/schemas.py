@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class LoginRequest(BaseModel):
@@ -10,6 +10,17 @@ class LoginRequest(BaseModel):
 
 class SimulationCriticalRequest(BaseModel):
     zone_id: int = Field(ge=1, le=4)
+
+
+class SimulationCriticalBatchRequest(BaseModel):
+    zone_ids: list[int] = Field(min_length=1, max_length=4)
+
+    @field_validator("zone_ids")
+    @classmethod
+    def zone_ids_must_be_unique(cls, values: list[int]) -> list[int]:
+        if len(set(values)) != len(values):
+            raise ValueError("zone_ids must not contain duplicates")
+        return values
 
 
 class ThresholdUpdate(BaseModel):
