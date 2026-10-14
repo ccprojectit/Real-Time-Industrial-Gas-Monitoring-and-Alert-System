@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     exotel_dlt_template_id: str = ""
     exotel_sms_type: str = ""
     sms_recipient_number: str = ""
+    sms_provider: str = "exotel"
+    textbee_base_url: str = "https://api.textbee.dev/api/v1"
+    textbee_api_key: str = ""
+    textbee_device_id: str = ""
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -33,10 +37,23 @@ class Settings(BaseSettings):
 
     @property
     def real_sms_ready(self) -> bool:
-        return bool(self.sms_enabled and self.sms_mode.lower() == "real" and all((
-            self.exotel_account_sid, self.exotel_api_key, self.exotel_api_token,
-            self.exotel_sender_id, self.sms_recipient_number,
-        )))
+        if not self.sms_enabled or self.sms_mode.lower() != "real":
+            return False
+
+        if self.sms_provider.lower() == "textbee":
+            return bool(
+                self.textbee_api_key
+                and self.textbee_device_id
+                and self.sms_recipient_number
+            )
+
+        return bool(
+            self.exotel_account_sid
+            and self.exotel_api_key
+            and self.exotel_api_token
+            and self.exotel_sender_id
+            and self.sms_recipient_number
+        )
 
 
 settings = Settings()
