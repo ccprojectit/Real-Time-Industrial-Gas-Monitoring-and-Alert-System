@@ -21,7 +21,7 @@ async function api<T>(path:string, options:RequestInit = {}):Promise<T> {
 }
 const dateTime = (s:string|null|undefined) => s ? new Date(s).toLocaleString(undefined,{dateStyle:'medium',timeStyle:'short'}) : '—'
 const shortTime = (s:string) => new Date(s).toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit',second:'2-digit'})
-const notificationLabel = (status:string) => status==='MOCK_RECORDED' ? 'MOCK ALERT RECORDED' : status.replaceAll('_',' ')
+const notificationLabel = (status:string) => status==='MOCK_RECORDED' ? 'ALERT RECORDED' : status.replaceAll('_',' ')
 
 export default function App() {
   const [state,setState]=useState<State>({zones:[],readings:[],incidents:[],notifications:[],simulator:false,authenticated:false,authRequired:true,demoResetAllowed:false,health:'connecting'})

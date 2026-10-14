@@ -124,18 +124,23 @@ async def save_critical_reading(conn, zone, value: float, *, measured_at=None):
 
 
 def simulation_reading(zone, prior: float | None) -> float:
-    """Generate changing Normal readings only; manual events own Critical status."""
+    """Keep manual Critical events latched and rising; other zones stay Normal."""
     normal_min = float(zone["normal_min"])
     critical = float(zone["critical_threshold"])
     normal_max = min(float(zone["normal_max"]), nextafter(critical, -float("inf")))
+    if prior is not None and float(prior) >= critical:
+        # Once a manual event crosses Critical, the simulator models an ongoing
+        # leak by increasing it on each tick. Only reset/clearing the readings
+        # ends this latched condition; normal simulation cannot make it vanish.
+        rise = max(critical * 0.01, 0.001)
+        return round(min(float(prior) + rise, 999999999.999), 3)
     step = max((normal_max - normal_min) * 0.08, normal_max * 0.035, 0.01)
-    critical_ceiling = nextafter(critical, -float("inf"))
 
     def safe_reading(value: float) -> float:
-        return min(max(round(value, 3), normal_min), normal_max, critical_ceiling)
+        return min(max(round(value, 3), normal_min), normal_max)
 
     center = (normal_min + normal_max) / 2
-    base = center if prior is None or float(prior) >= critical else float(prior)
+    base = center if prior is None else float(prior)
     return safe_reading(min(max(base + random.uniform(-step, step), normal_min), normal_max))
 
 
@@ -334,7 +339,7 @@ async def notifications(limit: int = 100):
     async with require_pool().acquire() as conn:
         rows = await conn.fetch("""SELECT n.id,n.incident_id,
             CASE WHEN n.event_severity='WARNING' THEN 'HISTORICAL' ELSE n.event_severity END AS event_severity,
-            n.mode,n.status,CASE WHEN n.event_severity='WARNING' THEN 'Historical mock notification record.' ELSE n.message END AS message,
+            n.mode,n.status,CASE WHEN n.event_severity='WARNING' THEN 'Historical notification record.' ELSE n.message END AS message,
             n.provider_message_id,n.created_at,
             i.zone_id,z.name AS zone_name,i.gas_name,i.reading,i.unit,i.created_at AS event_time
             FROM notifications n JOIN incidents i ON i.id=n.incident_id JOIN zones z ON z.id=i.zone_id

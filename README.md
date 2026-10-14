@@ -97,7 +97,7 @@ Prerequisites: Python 3.12, Node.js 20+, npm, and a Supabase project (or compati
 | POST | `/api/incidents/{id}/acknowledge`, `/resolve` | Loopback demo or signed-in non-loopback operator | Server records configured local actor or signed-in account |
 | WS | `/api/ws` | Loopback demo or signed-in non-loopback operator; exact allowed origin | Live state stream; UI also polls while disconnected |
 
-Automatic simulation writes readings only and is constrained to Normal values. A manual Critical event creates at most one unresolved Critical incident per zone and one mock notification for that incident. Existing unresolved legacy records are retained in history; legacy records are not treated as current zone statuses or open Critical incidents. After a manual Critical event, subsequent automatic readings remain Normal and do not resolve the Critical incident; an operator must explicitly resolve it. Resolve itself does not change the current reading/status.
+Automatic simulation writes readings only and is constrained to Normal values for zones without a Critical event. After a manual Critical event, that zone remains above its critical threshold and its reading rises on subsequent simulation ticks; the other zones remain in their Normal range. A manual Critical event creates at most one unresolved Critical incident per zone and one notification record for that incident. Existing unresolved legacy records are retained in history; legacy records are not treated as current zone statuses or open Critical incidents. Resolve itself does not change the current reading/status.
 
 ## SMS notifications
 

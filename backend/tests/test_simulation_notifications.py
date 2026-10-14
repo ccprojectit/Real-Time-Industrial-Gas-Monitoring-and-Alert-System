@@ -430,10 +430,23 @@ def test_critical_incidents_create_mock_records_without_network(monkeypatch):
 def test_automatic_simulation_samples_remain_normal_and_below_critical(zone, monkeypatch):
     monkeypatch.setattr(main.random, "random", lambda: 1.0)
     monkeypatch.setattr(main.random, "uniform", lambda low, high: (low + high) / 2)
-    for prior in (None, zone["normal_max"] * 0.4, zone["critical_threshold"] * 1.08):
+    for prior in (None, zone["normal_max"] * 0.4):
         reading = main.simulation_reading(zone, prior)
         assert zone["normal_min"] <= reading <= zone["normal_max"]
         assert reading < zone["critical_threshold"]
+
+
+@pytest.mark.parametrize("zone", [
+    {"critical_threshold":100,"normal_min":0,"normal_max":12},
+    {"critical_threshold":20,"normal_min":0,"normal_max":4},
+    {"critical_threshold":20,"normal_min":0,"normal_max":3},
+    {"critical_threshold":50,"normal_min":0,"normal_max":8},
+])
+def test_automatic_ticks_keep_manual_critical_readings_rising(zone):
+    prior = zone["critical_threshold"] * 1.08
+    reading = main.simulation_reading(zone, prior)
+    assert reading > prior
+    assert reading > zone["critical_threshold"]
 
 
 def test_critical_simulation_cooldown_returns_retry_after(monkeypatch):
