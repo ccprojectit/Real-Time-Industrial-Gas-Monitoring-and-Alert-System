@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse
 from .config import settings
 from .database import connect, close, require_pool
 from .notifications import notify_incident
-from .schemas import ActorRequest, LoginRequest, SimulationCriticalBatchRequest, SimulationCriticalRequest, ThresholdUpdate, classify
+from .schemas import ActorRequest, LoginRequest, SimulationCriticalBatchRequest, SimulationCriticalRequest
 from .security import COOKIE, create_session, current_operator, is_loopback_connection, local_demo_allowed, validate_remote_auth_configuration
 
 simulator_task: asyncio.Task | None = None
@@ -76,15 +76,14 @@ def validate_production_configuration() -> None:
 
 
 async def snapshot(conn):
-    rows = await conn.fetch("""SELECT z.id,z.name,z.gas_name,z.formula,z.unit,z.warning_threshold,z.critical_threshold,
+    rows = await conn.fetch("""SELECT z.id,z.name,z.gas_name,z.formula,z.unit,z.critical_threshold,
         latest.value AS current_reading, prev.value AS previous_reading,latest.measured_at AS last_updated,
         CASE WHEN latest.value IS NULL THEN 'NORMAL'
-             WHEN latest.value >= z.critical_threshold THEN 'CRITICAL'
-             WHEN latest.value >= z.warning_threshold THEN 'WARNING' ELSE 'NORMAL' END AS status,
+             WHEN latest.value >= z.critical_threshold THEN 'CRITICAL' ELSE 'NORMAL' END AS status,
         i.id::text AS active_incident_id
         FROM zones z LEFT JOIN LATERAL (SELECT value,measured_at FROM readings WHERE zone_id=z.id ORDER BY measured_at DESC,id DESC LIMIT 1) latest ON true
         LEFT JOIN LATERAL (SELECT value FROM readings WHERE zone_id=z.id ORDER BY measured_at DESC,id DESC OFFSET 1 LIMIT 1) prev ON true
-        LEFT JOIN LATERAL (SELECT id,severity FROM incidents WHERE zone_id=z.id AND state <> 'RESOLVED' ORDER BY created_at DESC LIMIT 1) i ON true
+        LEFT JOIN LATERAL (SELECT id,severity FROM incidents WHERE zone_id=z.id AND severity='CRITICAL' AND state <> 'RESOLVED' ORDER BY created_at DESC LIMIT 1) i ON true
         ORDER BY z.id""")
     return api_json([dict(r) for r in rows])
 
@@ -104,68 +103,39 @@ async def broadcast():
         return
 
 
-async def save_reading(conn, zone, value: float, *, measured_at=None, reading_persisted=False, recover_warning=False):
+async def save_critical_reading(conn, zone, value: float, *, measured_at=None):
     now = measured_at or datetime.now(timezone.utc)
-    status = classify(value, zone["warning_threshold"], zone["critical_threshold"])
-    if not reading_persisted:
-        await conn.execute("INSERT INTO readings(zone_id,value,unit,measured_at) VALUES($1,$2,$3,$4)", zone["id"], value, zone["unit"], now)
-    if status == "NORMAL":
-        if recover_warning:
-            recovered = await conn.fetchrow(
-                "UPDATE incidents SET state='RESOLVED',resolved_at=$1,resolved_by='Simulator recovery' "
-                "WHERE zone_id=$2 AND severity='WARNING' AND state <> 'RESOLVED' RETURNING id::text AS id",
-                now, zone["id"],
-            )
-            if recovered:
-                await conn.execute(
-                    "INSERT INTO audit_events(actor,action,entity_type,entity_id) VALUES('simulator','AUTO_RECOVERY','incident',$1)",
-                    recovered["id"],
-                )
-        return
-    if status != "NORMAL":
-        incident = await conn.fetchrow("""SELECT * FROM incidents WHERE zone_id=$1 AND state <> 'RESOLVED' ORDER BY created_at DESC LIMIT 1 FOR UPDATE""", zone["id"])
-        if incident is None:
-            incident = await conn.fetchrow("""INSERT INTO incidents(zone_id,gas_name,formula,severity,reading,unit,
-                warning_threshold_at_creation,critical_threshold_at_creation,threshold,created_at,critical_at,state)
-                VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'OPEN') RETURNING *""", zone["id"], zone["gas_name"], zone["formula"], status,
-                value, zone["unit"], zone["warning_threshold"], zone["critical_threshold"],
-                zone["critical_threshold"] if status == "CRITICAL" else zone["warning_threshold"],
-                now, now if status == "CRITICAL" else None)
-            await notify_incident(conn, {**dict(incident), "zone_name": zone["name"]}, status)
-        elif incident["severity"] == "WARNING" and status == "CRITICAL":
-            incident = await conn.fetchrow("UPDATE incidents SET severity='CRITICAL',reading=$1,escalation_threshold=$2,critical_at=$3 WHERE id=$4 RETURNING *",
-                                           value, zone["critical_threshold"], now, incident["id"])
-            await notify_incident(conn, {**dict(incident), "zone_name": zone["name"]}, "CRITICAL")
+    await conn.execute("INSERT INTO readings(zone_id,value,unit,measured_at) VALUES($1,$2,$3,$4)", zone["id"], value, zone["unit"], now)
+    # Old unresolved Warning incidents are retired (not deleted) so their legacy
+    # partial unique index cannot block a new Critical incident for this zone.
+    legacy = await conn.fetchrow("""UPDATE incidents SET state='RESOLVED',resolved_at=$1,
+        resolved_by='System (retired legacy alert)' WHERE zone_id=$2 AND severity='WARNING'
+        AND state <> 'RESOLVED' RETURNING id::text AS id""", now, zone["id"])
+    if legacy:
+        await conn.execute("INSERT INTO audit_events(actor,action,entity_type,entity_id) VALUES('system','RETIRE_LEGACY_ALERT','incident',$1)", legacy["id"])
+    incident = await conn.fetchrow("""SELECT * FROM incidents WHERE zone_id=$1 AND severity='CRITICAL'
+        AND state <> 'RESOLVED' ORDER BY created_at DESC LIMIT 1 FOR UPDATE""", zone["id"])
+    if incident is None:
+        incident = await conn.fetchrow("""INSERT INTO incidents(zone_id,gas_name,formula,severity,reading,unit,
+            warning_threshold_at_creation,critical_threshold_at_creation,threshold,created_at,critical_at,state)
+            VALUES($1,$2,$3,'CRITICAL',$4,$5,$6,$7,$7,$8,$8,'OPEN') RETURNING *""", zone["id"], zone["gas_name"], zone["formula"],
+            value, zone["unit"], zone["warning_threshold"], zone["critical_threshold"], now)
+        await notify_incident(conn, {**dict(incident), "zone_name": zone["name"]})
 
 
 def simulation_reading(zone, prior: float | None) -> float:
-    """Generate bounded normal readings with occasional warning excursions; never critical."""
+    """Generate changing Normal readings only; manual events own Critical status."""
     normal_min = float(zone["normal_min"])
-    normal_max = float(zone["normal_max"])
-    warning = float(zone["warning_threshold"])
     critical = float(zone["critical_threshold"])
-    warning_max = max(warning, critical - 0.001)
+    normal_max = min(float(zone["normal_max"]), nextafter(critical, -float("inf")))
     step = max((normal_max - normal_min) * 0.08, normal_max * 0.035, 0.01)
-    # Clamp after rounding as well: thresholds may be configured closer than
-    # the simulator's display precision, and rounding must never create a critical sample.
     critical_ceiling = nextafter(critical, -float("inf"))
 
     def safe_reading(value: float) -> float:
-        return min(round(value, 3), critical_ceiling)
+        return min(max(round(value, 3), normal_min), normal_max, critical_ceiling)
 
-    if prior is not None and float(prior) >= warning:
-        # Warning conditions recover to the normal band, otherwise fluctuate gently
-        # within warning. A manually triggered critical sample is never repeated.
-        if float(prior) >= critical or random.random() < 0.2:
-            base = min(float(prior), normal_max) if float(prior) < warning else normal_max * 0.85
-            return safe_reading(min(max(base + random.uniform(-step, step), normal_min), normal_max))
-        return safe_reading(min(max(float(prior) + random.uniform(-step, step), warning), warning_max))
-
-    if random.random() < 0.025:
-        return safe_reading(min(random.uniform(warning, min(warning * 1.15, warning_max)), warning_max))
-
-    center = min(warning * 0.48, normal_max)
-    base = float(prior) if prior is not None else center
+    center = (normal_min + normal_max) / 2
+    base = center if prior is None or float(prior) >= critical else float(prior)
     return safe_reading(min(max(base + random.uniform(-step, step), normal_min), normal_max))
 
 
@@ -178,11 +148,10 @@ async def simulator_loop():
         try:
             async with require_pool().acquire() as conn:
                 async with conn.transaction():
-                    zones = await conn.fetch("""SELECT z.*,
-                        latest.value AS prior_reading, active.severity AS active_incident_severity
+                    zones = await conn.fetch("""SELECT z.id,z.unit,z.critical_threshold,z.normal_min,z.normal_max,
+                        latest.value AS prior_reading
                         FROM zones z
                         LEFT JOIN LATERAL (SELECT value FROM readings WHERE zone_id=z.id ORDER BY measured_at DESC,id DESC LIMIT 1) latest ON true
-                        LEFT JOIN LATERAL (SELECT severity FROM incidents WHERE zone_id=z.id AND state <> 'RESOLVED' ORDER BY created_at DESC LIMIT 1) active ON true
                         ORDER BY z.id FOR UPDATE OF z""")
                     measured_at = datetime.now(timezone.utc)
                     cycle_readings = []
@@ -193,10 +162,6 @@ async def simulator_loop():
                         "INSERT INTO readings(zone_id,value,unit,measured_at) VALUES($1,$2,$3,$4)",
                         [(zone["id"], value, zone["unit"], measured_at) for zone, value in cycle_readings],
                     )
-                    for zone, value in cycle_readings:
-                        recover_warning = value < float(zone["warning_threshold"]) and zone["active_incident_severity"] == "WARNING"
-                        await save_reading(conn, zone, value, measured_at=measured_at, reading_persisted=True,
-                                           recover_warning=recover_warning)
             await broadcast()
         except asyncio.CancelledError:
             raise
@@ -295,8 +260,12 @@ async def login(body: LoginRequest, request: Request, response: Response):
 
 
 @app.post("/api/auth/logout")
-async def logout(response: Response):
-    response.delete_cookie(COOKIE, path="/")
+async def logout(request: Request, response: Response):
+    # Expire the cookie with the same cross-site attributes used at login.
+    # Browsers may reject a SameSite=None cookie deletion that omits Secure.
+    secure_cookie = settings.app_env.strip().lower() == "production" or not is_loopback_connection(request)
+    response.delete_cookie(COOKIE, path="/", httponly=True, secure=secure_cookie,
+                           samesite="none" if secure_cookie else "lax")
     return {"authenticated": False}
 
 
@@ -346,7 +315,11 @@ async def incidents(limit: int = 100):
     if not 1 <= limit <= 500:
         raise HTTPException(422, "limit must be between 1 and 500")
     async with require_pool().acquire() as conn:
-        rows = await conn.fetch("""SELECT i.*,COALESCE(i.escalation_threshold,i.threshold) AS display_threshold,i.id::text AS incident_id,z.name AS zone_name,
+        rows = await conn.fetch("""SELECT i.id::text AS incident_id,i.zone_id,z.name AS zone_name,i.gas_name,z.formula,
+            CASE WHEN i.severity='WARNING' THEN 'HISTORICAL' ELSE i.severity END AS severity,
+            i.reading,i.unit,i.threshold AS display_threshold,i.created_at,i.critical_at,
+            CASE WHEN i.severity='WARNING' THEN 'HISTORICAL' ELSE i.state END AS state,
+            i.acknowledged_at,i.acknowledged_by,i.resolved_at,i.resolved_by,
             n.mode AS notification_mode,n.status AS notification_status
             FROM incidents i JOIN zones z ON z.id=i.zone_id LEFT JOIN LATERAL
             (SELECT mode,status FROM notifications WHERE incident_id=i.id ORDER BY created_at DESC LIMIT 1) n ON true
@@ -359,7 +332,10 @@ async def notifications(limit: int = 100):
     if not 1 <= limit <= 500:
         raise HTTPException(422, "limit must be between 1 and 500")
     async with require_pool().acquire() as conn:
-        rows = await conn.fetch("""SELECT n.id,n.incident_id,n.event_severity,n.mode,n.status,n.message,n.provider_message_id,n.created_at,
+        rows = await conn.fetch("""SELECT n.id,n.incident_id,
+            CASE WHEN n.event_severity='WARNING' THEN 'HISTORICAL' ELSE n.event_severity END AS event_severity,
+            n.mode,n.status,CASE WHEN n.event_severity='WARNING' THEN 'Historical mock notification record.' ELSE n.message END AS message,
+            n.provider_message_id,n.created_at,
             i.zone_id,z.name AS zone_name,i.gas_name,i.reading,i.unit,i.created_at AS event_time
             FROM notifications n JOIN incidents i ON i.id=n.incident_id JOIN zones z ON z.id=i.zone_id
             ORDER BY n.created_at DESC LIMIT $1""", limit)
@@ -369,21 +345,6 @@ async def notifications(limit: int = 100):
 @app.get("/api/zones/{zone_id}/readings")
 async def zone_readings(zone_id: int, limit: int = 300):
     return await readings(zone_id, limit)
-
-
-@app.put("/api/zones/{zone_id}/thresholds")
-async def update_thresholds(zone_id: int, body: ThresholdUpdate, request: Request):
-    actor = current_operator(request)
-    if body.critical_threshold <= body.warning_threshold:
-        raise HTTPException(422, "Critical threshold must be greater than warning threshold")
-    async with require_pool().acquire() as conn:
-        row = await conn.fetchrow("UPDATE zones SET warning_threshold=$1,critical_threshold=$2,normal_min=LEAST(normal_min,$1*0.4),normal_max=LEAST(normal_max,$1*0.8),updated_at=now() WHERE id=$3 RETURNING id",
-                                  body.warning_threshold, body.critical_threshold, zone_id)
-        if not row:
-            raise HTTPException(404, "Zone not found")
-        await conn.execute("INSERT INTO audit_events(actor,action,entity_type,entity_id,metadata) VALUES($1,'UPDATE_THRESHOLDS','zone',$2,$3::jsonb)",
-                           actor, str(zone_id), json.dumps(body.model_dump()))
-        return api_json(dict(await conn.fetchrow("SELECT id,warning_threshold,critical_threshold FROM zones WHERE id=$1", zone_id)))
 
 
 @app.post("/api/simulation/start")
@@ -474,7 +435,6 @@ async def reset_demo_data(request: Request):
 
 
 async def critical_simulation_for_zones(zone_ids: list[int], actor: str) -> list[dict]:
-    global simulator_task, simulator_enabled
     if not zone_ids or len(zone_ids) != len(set(zone_ids)):
         raise HTTPException(422, "Select one or more distinct zone identifiers")
     measured_at = datetime.now(timezone.utc)
@@ -497,7 +457,7 @@ async def critical_simulation_for_zones(zone_ids: list[int], actor: str) -> list
                     zone = zones_by_id[zone_id]
                     threshold = float(zone["critical_threshold"])
                     value = round(max(threshold * 1.08, threshold + 0.001), 3)
-                    await save_reading(conn, zone, value, measured_at=measured_at)
+                    await save_critical_reading(conn, zone, value, measured_at=measured_at)
                     await conn.execute(
                         "INSERT INTO audit_events(actor,action,entity_type,entity_id) VALUES($1,'CRITICAL_SIMULATION','zone',$2)",
                         actor, str(zone["id"]),
@@ -506,9 +466,6 @@ async def critical_simulation_for_zones(zone_ids: list[int], actor: str) -> list
                                     "measured_at": measured_at.isoformat()})
         for zone_id in zone_ids:
             critical_simulation_last_trigger[zone_id] = now
-        if not simulator_enabled:
-            simulator_enabled = True
-            simulator_task = asyncio.create_task(simulator_loop())
     # Push the committed state to other connected dashboards immediately. The
     # initiating dashboard also applies the confirmed reading from this response.
     asyncio.create_task(broadcast())

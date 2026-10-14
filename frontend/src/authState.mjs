@@ -6,3 +6,7 @@ export function canOperateWithSession(session) {
 export function isUnauthorizedStatus(status) {
   return status === 401
 }
+
+export function isCurrentRequest(requestSequence, latestSequence) {
+  return requestSequence === latestSequence
+}

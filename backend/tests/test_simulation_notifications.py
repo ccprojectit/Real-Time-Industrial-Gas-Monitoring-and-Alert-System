@@ -48,23 +48,19 @@ class MemoryConnection:
 
     async def fetchrow(self, sql, *args):
         self.executed.append((sql, args))
+        if "UPDATE incidents SET state='RESOLVED'" in sql:
+            return None
         if "SELECT * FROM incidents" in sql:
-            return self.active if self.active and self.active.get("state") != "RESOLVED" else None
+            return self.active if self.active and self.active.get("severity") == "CRITICAL" and self.active.get("state") != "RESOLVED" else None
         if "INSERT INTO incidents" in sql:
             self.active = {
-                "id": f"incident-{len(self.created) + 1}", "severity": args[3],
-                "reading": args[4], "unit": args[5], "warning_threshold_at_creation": args[6],
-                "critical_threshold_at_creation": args[7], "threshold": args[8],
-                "created_at": args[9], "critical_at": args[10], "gas_name": args[1],
+                "id": f"incident-{len(self.created) + 1}", "severity": "CRITICAL",
+                "reading": args[3], "unit": args[4], "warning_threshold_at_creation": args[5],
+                "critical_threshold_at_creation": args[6], "threshold": args[6],
+                "created_at": args[7], "critical_at": args[7], "gas_name": args[1],
             }
             self.created.append(self.active)
             return self.active
-        if "UPDATE incidents SET severity" in sql:
-            self.active = {**self.active, "severity": "CRITICAL", "reading": args[0], "escalation_threshold": args[1]}
-            return self.active
-        if "UPDATE incidents SET state='RESOLVED'" in sql:
-            self.active = {**self.active, "state": "RESOLVED", "resolved_at": args[0], "resolved_by": "Simulator recovery"}
-            return {"id": self.active["id"]}
         raise AssertionError(sql)
 
 
@@ -102,17 +98,15 @@ class CriticalBatchConnection:
         raise AssertionError(sql)
 
     async def fetchrow(self, sql, *args):
+        if "UPDATE incidents SET state='RESOLVED'" in sql:
+            return None
         if "SELECT * FROM incidents" in sql:
-            return next((i for i in self.incidents if i["zone_id"]==args[0] and i["state"]!="RESOLVED"),None)
+            return next((i for i in self.incidents if i["zone_id"]==args[0] and i["severity"]=="CRITICAL" and i["state"]!="RESOLVED"),None)
         if "INSERT INTO incidents" in sql:
             incident={"id":f"incident-{len(self.incidents)+1}","zone_id":args[0],"gas_name":args[1],"formula":args[2],
-                "severity":args[3],"reading":args[4],"unit":args[5],"warning_threshold_at_creation":args[6],
-                "critical_threshold_at_creation":args[7],"threshold":args[8],"created_at":args[9],"critical_at":args[10],"state":"OPEN"}
+                "severity":"CRITICAL","reading":args[3],"unit":args[4],"warning_threshold_at_creation":args[5],
+                "critical_threshold_at_creation":args[6],"threshold":args[6],"created_at":args[7],"critical_at":args[7],"state":"OPEN"}
             self.incidents.append(incident)
-            return incident
-        if "UPDATE incidents SET severity" in sql:
-            incident=next(i for i in self.incidents if i["id"]==args[3])
-            incident.update({"severity":"CRITICAL","reading":args[0],"escalation_threshold":args[1],"critical_at":args[2]})
             return incident
         raise AssertionError(sql)
 
@@ -141,8 +135,8 @@ class CriticalBatchPool:
 def test_critical_simulation_creates_one_incident_per_selected_zone(monkeypatch):
     calls = []
 
-    async def no_sms(conn, incident, severity):
-        calls.append((incident, severity))
+    async def no_sms(conn, incident):
+        calls.append((incident, "CRITICAL"))
 
     monkeypatch.setattr(main, "notify_incident", no_sms)
     for zone_id, gas, formula, unit, warning, critical in [
@@ -155,7 +149,7 @@ def test_critical_simulation_creates_one_incident_per_selected_zone(monkeypatch)
             conn = MemoryConnection()
             zone = {"id": zone_id, "name": f"Zone {zone_id}", "gas_name": gas, "formula": formula,
                     "unit": unit, "warning_threshold": warning, "critical_threshold": critical}
-            await main.save_reading(conn, zone, critical * 1.08)
+            await main.save_critical_reading(conn, zone, critical * 1.08)
             assert len(conn.readings) == 1
             assert conn.created[0]["severity"] == "CRITICAL"
             assert conn.created[0]["threshold"] == critical
@@ -197,7 +191,7 @@ def test_critical_api_persists_immediately_and_rejects_rapid_duplicate(monkeypat
     pool = Pool()
     notified = []
     created_tasks = []
-    async def no_sms(_conn, incident, severity): notified.append((incident, severity))
+    async def no_sms(_conn, incident): notified.append((incident, "CRITICAL"))
     def hold_task(coro):
         coro.close()
         task = object()
@@ -225,7 +219,7 @@ def test_critical_api_persists_immediately_and_rejects_rapid_duplicate(monkeypat
         assert len(pool.conn.readings) == 1
         assert len(pool.conn.created) == 1
         assert notified[0][1] == "CRITICAL"
-        assert len(created_tasks) == 2  # simulator loop plus immediate WebSocket broadcast
+        assert len(created_tasks) == 1  # immediate WebSocket broadcast; critical trigger does not start simulation
         with pytest.raises(main.HTTPException) as error:
             await main.critical_simulation(main.SimulationCriticalRequest(zone_id=1), request)
         assert error.value.status_code == 429
@@ -258,7 +252,7 @@ def test_multi_zone_critical_creates_records_only_for_selected_zones_and_dedupli
 
     async def run():
         result=await main.critical_simulation_batch(main.SimulationCriticalBatchRequest(zone_ids=[1,3]),request)
-        assert result["simulator_running"] is True
+        assert result["simulator_running"] is False
         assert {item["zone_id"] for item in result["zones"]}=={1,3}
         assert len(conn.readings)==len(conn.incidents)==len(conn.notifications)==2
         for reading in conn.readings:
@@ -266,7 +260,7 @@ def test_multi_zone_critical_creates_records_only_for_selected_zones_and_dedupli
             assert reading["value"]>zone["critical_threshold"]
         assert {item["zone_id"] for item in conn.readings}=={1,3}
         assert all(item["status"]=="MOCK_RECORDED" and item["mode"]=="mock" for item in conn.notifications)
-        assert len(created)==2  # one simulator task and one WebSocket broadcast
+        assert len(created)==1  # one immediate WebSocket broadcast; no simulator auto-start
         with pytest.raises(main.HTTPException) as repeated:
             await main.critical_simulation_batch(main.SimulationCriticalBatchRequest(zone_ids=[1,3]),request)
         assert repeated.value.status_code==429
@@ -378,8 +372,8 @@ def test_broadcast_sends_one_serializable_state_frame_per_connected_client(monke
 def test_incident_deduplication_while_zone_condition_stays_active(monkeypatch):
     calls = []
 
-    async def no_sms(conn, incident, severity):
-        calls.append((incident, severity))
+    async def no_sms(conn, incident):
+        calls.append((incident, "CRITICAL"))
 
     monkeypatch.setattr(main, "notify_incident", no_sms)
 
@@ -387,53 +381,10 @@ def test_incident_deduplication_while_zone_condition_stays_active(monkeypatch):
         conn = MemoryConnection()
         zone = {"id": 1, "name": "Zone 1", "gas_name": "Carbon Monoxide", "formula": "CO",
                 "unit": "ppm", "warning_threshold": 35, "critical_threshold": 100}
-        await main.save_reading(conn, zone, 101)
-        await main.save_reading(conn, zone, 105)
+        await main.save_critical_reading(conn, zone, 101)
+        await main.save_critical_reading(conn, zone, 105)
         assert len(conn.created) == 1
         assert len(calls) == 1
-
-    asyncio.run(run())
-
-
-def test_warning_crossing_creates_one_incident_and_mock_notification(monkeypatch):
-    notified=[]
-    async def record_mock(_conn, incident, severity):
-        notified.append((incident["id"],severity))
-    monkeypatch.setattr(main,"notify_incident",record_mock)
-
-    async def run():
-        conn=MemoryConnection()
-        zone={"id":1,"name":"Zone 1","gas_name":"Carbon Monoxide","formula":"CO","unit":"ppm",
-              "warning_threshold":35,"critical_threshold":100}
-        await main.save_reading(conn,zone,36)
-        await main.save_reading(conn,zone,37)
-        assert len(conn.created)==1
-        assert conn.created[0]["severity"]=="WARNING"
-        assert notified==[(conn.created[0]["id"],"WARNING")]
-    asyncio.run(run())
-
-
-def test_warning_incident_escalates_once_to_critical(monkeypatch):
-    calls = []
-
-    async def no_sms(conn, incident, severity):
-        calls.append((incident, severity))
-
-    monkeypatch.setattr(main, "notify_incident", no_sms)
-
-    async def run():
-        conn = MemoryConnection()
-        zone = {"id": 1, "name": "Zone 1", "gas_name": "Carbon Monoxide", "formula": "CO",
-                "unit": "ppm", "warning_threshold": 35, "critical_threshold": 100}
-        await main.save_reading(conn, zone, 40)
-        assert conn.created[0]["severity"] == "WARNING"
-        assert len(calls) == 1 and calls[0][1] == "WARNING"
-        await main.save_reading(conn, zone, 100)
-        assert conn.active["severity"] == "CRITICAL"
-        assert conn.active["threshold"] == 35
-        assert conn.active["escalation_threshold"] == 100
-        assert len(calls) == 2
-        assert calls[1][1] == "CRITICAL"
 
     asyncio.run(run())
 
@@ -449,72 +400,40 @@ class NotificationConnection:
         self.saved = args
 
 
-@pytest.mark.parametrize("severity", ["WARNING", "CRITICAL"])
-def test_warning_and_critical_incidents_create_mock_records_without_network(monkeypatch, severity):
+def test_critical_incidents_create_mock_records_without_network(monkeypatch):
     def forbidden_network_client(*_args, **_kwargs):
         raise AssertionError("Mock notification must never create an external HTTP client")
 
     # If a future change reintroduces an HTTP client call in this module, fail this test.
     monkeypatch.setattr(notifications, "httpx", type("Httpx", (), {"AsyncClient": forbidden_network_client}), raising=False)
     conn = NotificationConnection()
-    incident = {"id": f"{severity.lower()}-1", "zone_name": "Zone 2", "gas_name": "Methane", "reading": 11,
+    incident = {"id": "critical-1", "zone_name": "Zone 2", "gas_name": "Methane", "reading": 21,
                 "unit": "% LEL", "created_at": datetime.now(timezone.utc)}
 
-    asyncio.run(notifications.notify_incident(conn, incident, severity))
+    asyncio.run(notifications.notify_incident(conn, incident))
 
     assert conn.saved[0] == incident["id"]
-    assert conn.saved[1] == severity
+    assert conn.saved[1] == "CRITICAL"
     assert conn.saved[2] == "mock"
     assert conn.saved[3] == "MOCK_RECORDED"
-    assert f"{severity} gas alert" in conn.saved[4]
+    assert "CRITICAL gas alert" in conn.saved[4]
     assert conn.saved[5] is None
     assert "Mock only; no SMS sent" in json.loads(conn.saved[6])["detail"]
 
 
 @pytest.mark.parametrize("zone", [
-    {"warning_threshold":35,"critical_threshold":100,"normal_min":0,"normal_max":12},
-    {"warning_threshold":10,"critical_threshold":20,"normal_min":0,"normal_max":4},
-    {"warning_threshold":10,"critical_threshold":20,"normal_min":0,"normal_max":3},
-    {"warning_threshold":25,"critical_threshold":50,"normal_min":0,"normal_max":8},
-    {"warning_threshold":19.9995,"critical_threshold":20,"normal_min":0,"normal_max":19.9},
+    {"critical_threshold":100,"normal_min":0,"normal_max":12},
+    {"critical_threshold":20,"normal_min":0,"normal_max":4},
+    {"critical_threshold":20,"normal_min":0,"normal_max":3},
+    {"critical_threshold":50,"normal_min":0,"normal_max":8},
 ])
-def test_automatic_simulation_samples_never_reach_critical(zone, monkeypatch):
+def test_automatic_simulation_samples_remain_normal_and_below_critical(zone, monkeypatch):
     monkeypatch.setattr(main.random, "random", lambda: 1.0)
     monkeypatch.setattr(main.random, "uniform", lambda low, high: (low + high) / 2)
-    for prior in (None, zone["normal_max"] * 0.4):
+    for prior in (None, zone["normal_max"] * 0.4, zone["critical_threshold"] * 1.08):
         reading = main.simulation_reading(zone, prior)
         assert zone["normal_min"] <= reading <= zone["normal_max"]
-        assert reading < zone["warning_threshold"]
-    for prior in (zone["warning_threshold"], zone["critical_threshold"] * 1.08):
-        reading=main.simulation_reading(zone,prior)
-        assert zone["normal_min"] <= reading < zone["critical_threshold"]
-
-
-@pytest.mark.parametrize("zone", [
-    {"warning_threshold":35,"critical_threshold":100,"normal_min":0,"normal_max":12},
-    {"warning_threshold":10,"critical_threshold":20,"normal_min":0,"normal_max":4},
-    {"warning_threshold":10,"critical_threshold":20,"normal_min":0,"normal_max":3},
-    {"warning_threshold":25,"critical_threshold":50,"normal_min":0,"normal_max":8},
-    {"warning_threshold":19.9995,"critical_threshold":20,"normal_min":0,"normal_max":19.9},
-])
-def test_automatic_simulation_can_enter_warning_but_stays_below_critical(zone, monkeypatch):
-    monkeypatch.setattr(main.random, "random", lambda: 0.0)
-    monkeypatch.setattr(main.random, "uniform", lambda low, high: high)
-    reading = main.simulation_reading(zone, zone["normal_max"])
-    assert zone["warning_threshold"] <= reading < zone["critical_threshold"]
-
-
-def test_warning_recovery_resolves_only_the_warning_incident(monkeypatch):
-    async def run():
-        conn = MemoryConnection(active={"id":"warning-1","severity":"WARNING","state":"OPEN"})
-        zone = {"id":1,"name":"Zone 1","gas_name":"Carbon Monoxide","formula":"CO","unit":"ppm",
-                "warning_threshold":35,"critical_threshold":100}
-        await main.save_reading(conn, zone, 10, recover_warning=True)
-        assert conn.active["state"] == "RESOLVED"
-        assert conn.active["resolved_by"] == "Simulator recovery"
-        assert any("AUTO_RECOVERY" in sql for sql, _ in conn.executed)
-
-    asyncio.run(run())
+        assert reading < zone["critical_threshold"]
 
 
 def test_critical_simulation_cooldown_returns_retry_after(monkeypatch):
@@ -610,8 +529,8 @@ def test_simulator_stops_after_configured_maximum_runtime(monkeypatch):
 def test_simulator_batches_zone_readings_in_one_database_write(monkeypatch):
     zones = [
         {"id": zone_id, "name": f"Zone {zone_id}", "gas_name": "Gas", "unit": "ppm",
-         "warning_threshold": 50, "critical_threshold": 100, "normal_min": 0, "normal_max": 20,
-         "prior_reading": 5, "active_incident_severity": None}
+         "critical_threshold": 100, "normal_min": 0, "normal_max": 20,
+         "prior_reading": 5}
         for zone_id in range(1, 5)
     ]
 
@@ -620,10 +539,11 @@ def test_simulator_batches_zone_readings_in_one_database_write(monkeypatch):
         async def __aexit__(self, *_): return False
 
     class Conn:
-        def __init__(self): self.batch = []
+        def __init__(self): self.batch = []; self.non_reading_writes = []
         def transaction(self): return Tx()
         async def fetch(self, _sql): return zones
         async def executemany(self, _sql, rows): self.batch = list(rows)
+        async def execute(self, sql, *_args): self.non_reading_writes.append(sql)
         async def fetchval(self, *_args): return None
 
     class Pool:
@@ -647,7 +567,8 @@ def test_simulator_batches_zone_readings_in_one_database_write(monkeypatch):
 
     assert len(pool.conn.batch) == 4
     assert {row[0] for row in pool.conn.batch} == {1, 2, 3, 4}
-    assert all(row[1] < 50 for row in pool.conn.batch)
+    assert all(0 <= row[1] < 100 for row in pool.conn.batch)
+    assert pool.conn.non_reading_writes == []  # no automatic incidents or notifications
 
 
 def test_unauthenticated_local_demo_can_start_and_stop_simulation(monkeypatch):
@@ -696,7 +617,7 @@ def test_all_privileged_api_routes_require_authentication(monkeypatch):
     monkeypatch.setattr(main.settings, "app_env", "development")
     monkeypatch.setattr(main.settings, "auth_required", True)
     with TestClient(main.app, client=("127.0.0.1", 1234)) as client:
-        assert client.put("/api/zones/1/thresholds", json={"warning_threshold":35,"critical_threshold":100}).status_code == 401
+        assert client.put("/api/zones/1/thresholds", json={"critical_threshold":100}).status_code == 404
         assert client.post("/api/simulation/critical", json={"zone_id":1}).status_code == 401
         assert client.post("/api/simulation/critical/batch", json={"zone_ids":[1,3]}).status_code == 401
         assert client.post("/api/demo/reset").status_code == 401

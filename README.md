@@ -1,6 +1,6 @@
 # Real-Time Industrial Gas Monitoring and Alert System
 
-A software-only, four-zone gas monitoring application for a B.Tech final-year project. The FastAPI service owns simulation, threshold classification, incidents, persistence, and notifications. React displays server state and provides protected operator controls. PostgreSQL is hosted by Supabase.
+A software-only, four-zone gas monitoring application for a B.Tech final-year project. The FastAPI service owns simulation, Critical threshold decisions, incidents, persistence, and mock notifications. React displays server state and provides protected operator controls. PostgreSQL is hosted by Supabase.
 
 **Safety:** readings are software-generated, not physical sensor measurements. Thresholds are illustrative application defaults, not certified industrial exposure or alarm limits. This application does not replace certified gas detectors, a safety instrumented system, or site emergency procedures.
 
@@ -18,21 +18,21 @@ The frontend never writes readings or makes threshold decisions. Read APIs remai
 
 ### Default zones
 
-| Zone | Gas | Unit | Warning | Critical | Normal simulator range |
-|---|---|---:|---:|---:|---:|
-| Zone 1 | Carbon Monoxide (CO) | ppm | 35 | 100 | 0–12 |
-| Zone 2 | Methane (CH4) | % LEL | 10 | 20 | 0–4 |
-| Zone 3 | Hydrogen Sulfide (H2S) | ppm | 10 | 20 | 0–3 |
-| Zone 4 | Ammonia (NH3) | ppm | 25 | 50 | 0–8 |
+| Zone | Gas | Unit | Critical | Automatic simulation range |
+|---|---|---:|---:|---:|
+| Zone 1 | Carbon Monoxide (CO) | ppm | 100 | 0–12 |
+| Zone 2 | Methane (CH4) | % LEL | 20 | 0–4 |
+| Zone 3 | Hydrogen Sulfide (H2S) | ppm | 20 | 0–3 |
+| Zone 4 | Ammonia (NH3) | ppm | 50 | 0–8 |
 
-These values only demonstrate gas-specific configuration and status transitions. Have a qualified safety professional set any values for a real facility. Thresholds can be changed through the authenticated `PUT /api/zones/{zone_id}/thresholds` API; an incident stores both thresholds active at creation and the threshold crossed for its initial and any critical escalation event. The database enforces `critical > warning`.
+These values are illustrative software settings, not certified safety limits. Automatic simulation produces Normal readings only and never creates incidents or notifications. Only an authenticated manual Critical Simulation creates incidents and mock notification records. Have a qualified safety professional set values for any real facility.
 
 ## Local setup
 
 Prerequisites: Python 3.12, Node.js 20+, npm, and a Supabase project (or compatible PostgreSQL database for local development). No hardware is required.
 
 1. Create a Supabase project. In **Project Settings → Database**, obtain the connection string. Use the session/pooler connection if the chosen backend host requires IPv4; retain TLS (`sslmode=require`). Keep this credential on the backend only.
-2. In Supabase **SQL Editor**, run the checked-in migrations in numeric order: [`database/migrations/001_initial.sql`](database/migrations/001_initial.sql), then [`database/migrations/002_severity_notifications.sql`](database/migrations/002_severity_notifications.sql). The second migration adds separate warning/critical notification records while preserving existing history. Schema setup is explicit; backend startup never applies migrations or clears history.
+2. In Supabase **SQL Editor**, run the checked-in migrations in numeric order: [`database/migrations/001_initial.sql`](database/migrations/001_initial.sql), then [`database/migrations/002_severity_notifications.sql`](database/migrations/002_severity_notifications.sql). The database schema retains legacy threshold columns, severity constraints, and existing records for compatibility with already-provisioned databases. Runtime APIs expose only Normal/Critical states; legacy records are presented as Historical and ignored in current zone counts. Do not rewrite or rerun applied migrations. Backend startup never applies migrations or clears history.
 3. Create a dedicated backend database login instead of using Supabase's `postgres` or service-role credential. Generate a strong password and run this in SQL Editor after replacing the quoted placeholder (do not commit the real password):
 
    ```sql
@@ -54,7 +54,7 @@ Prerequisites: Python 3.12, Node.js 20+, npm, and a Supabase project (or compati
    Grant `DELETE` only when the authenticated production reset feature is intentionally required. The operation is destructive and is recorded in `audit_events`; the API still requires an authorized operator and allowed origin. Do not grant `TRUNCATE`, schema ownership, or DDL. Use distinct database credentials for development and production.
 
    The migrations do not configure Supabase Data API grants or RLS. Before exposing the Supabase project, verify effective Data API grants and prevent `anon`/`authenticated` direct table access unless intentionally required. If enabling RLS, ensure the dedicated backend database role still has narrowly scoped access through grants and policies. The application connects from the backend using its dedicated PostgreSQL role; it does not need a Supabase service-role key in the frontend.
-4. Copy `backend/.env.example` to `backend/.env`. For a local loopback demo, keep `APP_ENV=development` and `AUTH_REQUIRED=false`. Notifications are database-backed mock records only; the application has no outbound SMS integration. No-login controls and WebSocket access work only for loopback clients. Automatic readings fluctuate in the normal range and occasionally enter warning, but are capped below every zone's configured critical threshold. Warning incidents are automatically resolved after a normal reading returns. Critical values can only be produced by the protected critical-simulation API. The simulator interval defaults to 0.35 seconds and can be adjusted with `SIMULATOR_INTERVAL_SECONDS` (0.25–10 seconds); it stops after `SIMULATOR_MAX_RUNTIME_SECONDS` (default 900; maximum 3600). Critical simulations have a short per-zone cooldown. Keep credentials out of source control.
+4. Copy `backend/.env.example` to `backend/.env`. For a local loopback demo, keep `APP_ENV=development` and `AUTH_REQUIRED=false`. Notifications are database-backed mock records only; the application has no outbound SMS integration. No-login controls and WebSocket access work only for loopback clients. Automatic readings fluctuate within the Normal range and never create incidents or notifications. Critical values can only be produced by the protected single-zone or multi-zone Critical Simulation API. The simulator interval defaults to 0.35 seconds and can be adjusted with `SIMULATOR_INTERVAL_SECONDS` (0.25–10 seconds); it stops after `SIMULATOR_MAX_RUNTIME_SECONDS` (default 900; maximum 3600). Critical simulations have a short per-zone cooldown. Keep credentials out of source control.
 5. Install and run the API (PowerShell):
 
    ```powershell
@@ -94,19 +94,18 @@ Prerequisites: Python 3.12, Node.js 20+, npm, and a Supabase project (or compati
 | POST | `/api/simulation/critical` | Loopback demo or signed-in non-loopback operator | JSON `{"zone_id":1}`; per-zone cooldown |
 | POST | `/api/simulation/critical/batch` | Loopback demo or signed-in non-loopback operator | JSON `{"zone_ids":[1,3]}`; validates and commits all selected zones atomically; returns `{"zones":[{"zone_id":1,"reading":108,"status":"CRITICAL","measured_at":"…"}],"simulator_running":true}` |
 | POST | `/api/demo/reset` | Loopback development client or signed-in operator in production | Stops simulation and transactionally deletes readings, incidents, and notifications; preserves zones, thresholds, settings, and audit history |
-| PUT | `/api/zones/{id}/thresholds` | Loopback demo or signed-in non-loopback operator | JSON `{"warning_threshold":35,"critical_threshold":100}` |
 | POST | `/api/incidents/{id}/acknowledge`, `/resolve` | Loopback demo or signed-in non-loopback operator | Server records configured local actor or signed-in account |
 | WS | `/api/ws` | Loopback demo or signed-in non-loopback operator; exact allowed origin | Live state stream; UI also polls while disconnected |
 
-An event creates at most one unresolved incident per zone; a warning can escalate in place to critical. Warning notifications are recorded immediately on crossing the warning threshold; critical notifications are recorded immediately on a critical reading or escalation. There is one notification per incident per severity, so repeated readings do not create duplicate notification records. Automatic readings never reach the critical threshold, including after a manual critical event; that critical incident remains in history until an operator explicitly resolves it. Resolve itself does not change the current reading/status.
+Automatic simulation writes readings only and is constrained to Normal values. A manual Critical event creates at most one unresolved Critical incident per zone and one mock notification for that incident. Existing unresolved legacy records are retained in history; legacy records are not treated as current zone statuses or open Critical incidents. After a manual Critical event, subsequent automatic readings remain Normal and do not resolve the Critical incident; an operator must explicitly resolve it. Resolve itself does not change the current reading/status.
 
 ## SMS notifications
 
-The dashboard retains SMS notification history, but notifications are simulated records only. For each eligible warning or critical incident, the backend stores a `MOCK_RECORDED` notification with its message and timestamp in Supabase and clearly marks that no SMS was sent. No external SMS service, network request, recipient configuration, or delivery claim is used by this project.
+The dashboard retains notification history, but notifications are simulated records only. A manual Critical incident stores one `MOCK_RECORDED` notification with its message and timestamp in Supabase. No external SMS service, network request, recipient configuration, or delivery claim is used by this project. Any preserved legacy notification rows are displayed as historical records.
 
 ## Tests and build
 
-From `backend/`, with its virtual environment active: `python -m pytest`. Unit tests cover classification boundaries, gas-specific thresholds, per-zone critical events, incident deduplication/escalation, mock warning/critical notification records and the absence of outbound HTTP calls, authentication, simulator single-loop start/stop controls, request validation, reading/incident writes, and reset authorization/scope. They use fake database connections; persistence against a real PostgreSQL instance still needs an integration environment. Frontend production build: from `frontend/`, run `npm ci`, then `npm run build`.
+From `backend/`, with its virtual environment active: `python -m pytest`. Unit tests cover Normal/Critical classification, gas-specific critical settings, Normal-only simulation for all zones, multi-zone critical events, incident deduplication, Critical mock notifications and the absence of outbound HTTP calls, authentication, simulator start/stop controls, request validation, reading/incident writes, and reset authorization/scope. They use fake database connections; persistence against a real PostgreSQL instance still needs an integration environment. Frontend production build: from `frontend/`, run `npm ci`, then `npm run build`.
 
 ## Deployment
 

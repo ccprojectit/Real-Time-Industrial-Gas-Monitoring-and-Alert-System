@@ -5,12 +5,12 @@ export interface SummaryZone {
 
 export interface SummaryIncident {
   incident_id: string
+  severity: string
   state: string
 }
 
 export interface DashboardSummary {
   normal: number
-  warning: number
   critical: number
   openIncidents: number
 }

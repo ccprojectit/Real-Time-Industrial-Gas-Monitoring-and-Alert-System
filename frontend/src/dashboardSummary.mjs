@@ -6,8 +6,7 @@ export function calculateDashboardSummary(zones, incidents) {
 
   return {
     normal: zoneList.filter((zone) => zone.status === 'NORMAL').length,
-    warning: zoneList.filter((zone) => zone.status === 'WARNING').length,
     critical: zoneList.filter((zone) => zone.status === 'CRITICAL').length,
-    openIncidents: incidentList.filter((incident) => incident.state !== 'RESOLVED').length,
+    openIncidents: incidentList.filter((incident) => incident.severity === 'CRITICAL' && incident.state !== 'RESOLVED').length,
   }
 }
