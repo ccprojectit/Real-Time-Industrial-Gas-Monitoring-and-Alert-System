@@ -23,6 +23,8 @@ services:
         value: "true"
       - key: SIMULATOR_MAX_RUNTIME_SECONDS
         value: "900"
+      - key: SIMULATOR_INTERVAL_SECONDS
+        value: "0.35"
       - key: CRITICAL_SIMULATION_COOLDOWN_SECONDS
         value: "5"
       - key: SMS_MODE

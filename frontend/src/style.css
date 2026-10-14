@@ -51,3 +51,5 @@ td{font-size:13px;padding:12px 10px}
 .reset-button{background:#fff;border-color:#d7dee7;color:#5b6675}
 .reset-button:hover:not(:disabled){background:#f7f8fa;border-color:#bdc7d3}
 @media(max-width:1100px){.control-actions{margin-top:12px;justify-content:flex-start;flex-wrap:wrap}}
+.access-note{flex-basis:100%;margin:4px 0 0 48px;color:#7b8796;font-size:12px;line-height:1.45}
+@media(max-width:760px){.access-note{margin-left:0}.control-panel{align-items:flex-start}.control-actions{width:100%}}

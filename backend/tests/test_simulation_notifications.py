@@ -94,6 +94,119 @@ def test_critical_simulation_creates_one_incident_per_selected_zone(monkeypatch)
     assert all(severity == "CRITICAL" for _, severity in calls)
 
 
+def test_critical_api_persists_immediately_and_rejects_rapid_duplicate(monkeypatch):
+    zone = {"id":1, "name":"Zone 1", "gas_name":"Carbon Monoxide", "formula":"CO", "unit":"ppm",
+            "warning_threshold":35, "critical_threshold":100, "normal_min":0, "normal_max":12}
+
+    class Conn(MemoryConnection):
+        class Tx:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_): return False
+
+        def transaction(self): return self.Tx()
+
+        async def fetchrow(self, sql, *args):
+            if "SELECT * FROM zones" in sql:
+                return zone
+            return await super().fetchrow(sql, *args)
+
+    class Pool:
+        def __init__(self): self.conn = Conn()
+        def acquire(self): return self
+        async def __aenter__(self): return self.conn
+        async def __aexit__(self, *_): return False
+
+    pool = Pool()
+    notified = []
+    created_tasks = []
+    async def no_sms(_conn, incident, severity): notified.append((incident, severity))
+    def hold_task(coro):
+        coro.close()
+        task = object()
+        created_tasks.append(task)
+        return task
+
+    monkeypatch.setattr(main, "require_pool", lambda: pool)
+    monkeypatch.setattr(main, "notify_incident", no_sms)
+    monkeypatch.setattr(main, "current_operator", lambda _request: "demo-operator")
+    monkeypatch.setattr(main.asyncio, "create_task", hold_task)
+    monkeypatch.setattr(main, "simulator_enabled", False)
+    monkeypatch.setattr(main, "simulator_task", None)
+    monkeypatch.setattr(main.settings, "critical_simulation_cooldown_seconds", 5)
+    main.critical_simulation_last_trigger.clear()
+    from starlette.requests import Request
+    request = Request({"type":"http", "method":"POST", "path":"/api/simulation/critical", "headers":[],
+                       "client":("127.0.0.1",1234), "server":("127.0.0.1",8000), "scheme":"http"})
+
+    async def run():
+        first = await main.critical_simulation(main.SimulationCriticalRequest(zone_id=1), request)
+        assert first == {"zone_id":1, "reading":108.0, "status":"CRITICAL"}
+        assert len(pool.conn.readings) == 1
+        assert len(pool.conn.created) == 1
+        assert notified[0][1] == "CRITICAL"
+        assert len(created_tasks) == 1
+        with pytest.raises(main.HTTPException) as error:
+            await main.critical_simulation(main.SimulationCriticalRequest(zone_id=1), request)
+        assert error.value.status_code == 429
+        assert len(pool.conn.readings) == 1
+
+    asyncio.run(run())
+    main.critical_simulation_last_trigger.clear()
+
+
+def test_repeated_start_requests_create_only_one_simulator_task(monkeypatch):
+    created = []
+    def hold_task(coro):
+        coro.close()
+        task = object()
+        created.append(task)
+        return task
+
+    monkeypatch.setattr(main, "current_operator", lambda _request: "demo-operator")
+    monkeypatch.setattr(main.asyncio, "create_task", hold_task)
+    monkeypatch.setattr(main, "simulator_enabled", False)
+    monkeypatch.setattr(main, "simulator_task", None)
+    from starlette.requests import Request
+    request = Request({"type":"http", "method":"POST", "path":"/api/simulation/start", "headers":[],
+                       "client":("127.0.0.1",1234), "server":("127.0.0.1",8000), "scheme":"http"})
+
+    async def run():
+        assert await main.start_simulation(request) == {"simulator_running":True}
+        assert await main.start_simulation(request) == {"simulator_running":True}
+
+    asyncio.run(run())
+    assert len(created) == 1
+
+
+def test_broadcast_sends_one_serializable_state_frame_per_connected_client(monkeypatch):
+    class Conn:
+        async def fetch(self, _sql):
+            return [{"id":1, "name":"Zone 1", "gas_name":"Carbon Monoxide", "formula":"CO", "unit":"ppm",
+                     "warning_threshold":35, "critical_threshold":100, "current_reading":12,
+                     "previous_reading":11, "last_updated":datetime.now(timezone.utc),
+                     "status":"NORMAL", "active_incident_id":None}]
+
+    class Pool:
+        def acquire(self): return self
+        async def __aenter__(self): return Conn()
+        async def __aexit__(self, *_): return False
+
+    class Socket:
+        def __init__(self): self.frames=[]
+        async def send_text(self, value): self.frames.append(value)
+
+    socket=Socket()
+    monkeypatch.setattr(main, "require_pool", lambda: Pool())
+    monkeypatch.setattr(main, "clients", {socket})
+    monkeypatch.setattr(main, "simulator_enabled", True)
+    asyncio.run(main.broadcast())
+    assert len(socket.frames)==1
+    frame=json.loads(socket.frames[0])
+    assert frame["type"]=="state"
+    assert frame["simulator_running"] is True
+    assert frame["zones"][0]["current_reading"]==12
+
+
 def test_incident_deduplication_while_zone_condition_stays_active(monkeypatch):
     calls = []
 
@@ -436,6 +549,7 @@ def test_demo_reset_is_post_only_and_no_generic_delete_routes_are_registered():
     paths = main.app.openapi()["paths"]
     assert paths["/api/demo/reset"]["post"]
     assert all("delete" not in methods for methods in paths.values())
+    assert "delete" not in paths["/api/demo/reset"]
 
 
 def test_demo_reset_clears_history_preserves_zones_and_audits(monkeypatch):
@@ -478,19 +592,59 @@ def test_demo_reset_clears_history_preserves_zones_and_audits(monkeypatch):
     assert "RESET_DEMO_DATA" in pool.conn.audit[0][0]
 
 
-def test_demo_reset_is_unavailable_outside_development_and_test(monkeypatch):
+def test_authenticated_production_operator_can_reset_data_transactionally(monkeypatch):
+    class Tx:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return False
+
+    class Conn:
+        def __init__(self): self.deleted = []; self.audit = []
+        def transaction(self): return Tx()
+        async def fetchval(self, sql):
+            self.deleted.append(sql)
+            return 1
+        async def execute(self, sql, *args): self.audit.append((sql, args))
+
+    class Pool:
+        def __init__(self): self.conn = Conn()
+        def acquire(self): return self
+        async def __aenter__(self): return self.conn
+        async def __aexit__(self, *_): return False
+
+    pool = Pool()
+    monkeypatch.setattr(main.settings, "app_env", "production")
+    monkeypatch.setattr(main, "current_operator", lambda _request: "signed-in-operator")
+    monkeypatch.setattr(main, "require_pool", lambda: pool)
+    monkeypatch.setattr(main, "broadcast", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(main, "simulator_enabled", False)
+    monkeypatch.setattr(main, "simulator_task", None)
+    from starlette.requests import Request
+    request = Request({"type":"http", "method":"POST", "path":"/api/demo/reset", "headers":[],
+                       "client":("127.0.0.1",1234), "server":("127.0.0.1",8000), "scheme":"http"})
+    result = asyncio.run(main.reset_demo_data(request))
+    assert result["simulator_running"] is False
+    assert result["deleted"] == {"readings":1, "incidents":1, "notifications":1}
+    assert all("DELETE FROM zones" not in sql for sql in pool.conn.deleted)
+    assert len(pool.conn.audit) == 1
+
+
+def test_duplicate_reset_is_rejected_without_waiting(monkeypatch):
     monkeypatch.setattr(main.settings, "app_env", "production")
     monkeypatch.setattr(main, "current_operator", lambda _request: "signed-in-operator")
     from starlette.requests import Request
     request = Request({"type":"http", "method":"POST", "path":"/api/demo/reset", "headers":[],
-                       "client":("127.0.0.1",1234), "server":("127.0.0.1",8000), "scheme":"http"})
+                       "client":("203.0.113.20",1234), "server":("127.0.0.1",8000), "scheme":"https"})
 
-    try:
-        asyncio.run(main.reset_demo_data(request))
-    except main.HTTPException as exc:
-        assert exc.status_code == 404
-    else:
-        raise AssertionError("demo reset must be unavailable in production")
+    async def run():
+        await main.demo_reset_lock.acquire()
+        try:
+            with pytest.raises(main.HTTPException) as error:
+                await main.reset_demo_data(request)
+            assert error.value.status_code == 409
+        finally:
+            main.demo_reset_lock.release()
+
+    asyncio.run(run())
 
 
 def test_demo_reset_is_unavailable_to_remote_development_clients(monkeypatch):

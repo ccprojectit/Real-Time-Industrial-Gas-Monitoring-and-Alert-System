@@ -23,6 +23,7 @@ simulator_control_lock = asyncio.Lock()
 clients: set[WebSocket] = set()
 login_failures: dict[str, tuple[int, float]] = {}
 critical_simulation_last_trigger: dict[int, float] = {}
+demo_reset_lock = asyncio.Lock()
 
 
 def api_json(value):
@@ -167,7 +168,7 @@ async def simulator_loop():
         except Exception:
             # Keep the task alive across transient DB errors; health remains available and next cycle retries.
             pass
-        interval = max(0.5, settings.simulator_interval_seconds)
+        interval = settings.simulator_interval_seconds
         elapsed = loop.time() - cycle_started
         await asyncio.sleep(max(0.05, interval - elapsed))
     if simulator_enabled and loop.time() >= deadline:
@@ -381,49 +382,52 @@ async def stop_simulation(request: Request):
 
 @app.post("/api/demo/reset")
 async def reset_demo_data(request: Request):
-    """Clear generated demo history without deleting zone or threshold configuration."""
+    """Clear generated simulation history without deleting zones, settings, or audit records."""
     global simulator_task, simulator_enabled
     actor = current_operator(request)
-    if settings.app_env.strip().lower() not in {"development", "test"} or not is_loopback_connection(request):
-        raise HTTPException(404, "Demo data reset is only available in development or test")
+    if settings.app_env.strip().lower() in {"development", "test"} and not is_loopback_connection(request):
+        raise HTTPException(404, "Data reset is only available to local development operators")
+    if demo_reset_lock.locked():
+        raise HTTPException(409, "A data reset is already in progress")
 
-    async with simulator_control_lock:
-        simulator_enabled = False
-        task = simulator_task
-        simulator_task = None
-        if task:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+    async with demo_reset_lock:
+        async with simulator_control_lock:
+            simulator_enabled = False
+            task = simulator_task
+            simulator_task = None
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
-        async with require_pool().acquire() as conn:
-            async with conn.transaction():
-                notifications_deleted = await conn.fetchval(
-                    "WITH deleted AS (DELETE FROM notifications RETURNING 1) SELECT count(*) FROM deleted"
-                )
-                readings_deleted = await conn.fetchval(
-                    "WITH deleted AS (DELETE FROM readings RETURNING 1) SELECT count(*) FROM deleted"
-                )
-                incidents_deleted = await conn.fetchval(
-                    "WITH deleted AS (DELETE FROM incidents RETURNING 1) SELECT count(*) FROM deleted"
-                )
-                await conn.execute(
-                    "INSERT INTO audit_events(actor,action,entity_type,entity_id,metadata) "
-                    "VALUES($1,'RESET_DEMO_DATA','demo','all',$2::jsonb)",
-                    actor,
-                    json.dumps({
-                        "notifications_deleted": notifications_deleted,
-                        "readings_deleted": readings_deleted,
-                        "incidents_deleted": incidents_deleted,
-                    }),
-                )
-        critical_simulation_last_trigger.clear()
+            async with require_pool().acquire() as conn:
+                async with conn.transaction():
+                    notifications_deleted = await conn.fetchval(
+                        "WITH deleted AS (DELETE FROM notifications RETURNING 1) SELECT count(*) FROM deleted"
+                    )
+                    readings_deleted = await conn.fetchval(
+                        "WITH deleted AS (DELETE FROM readings RETURNING 1) SELECT count(*) FROM deleted"
+                    )
+                    incidents_deleted = await conn.fetchval(
+                        "WITH deleted AS (DELETE FROM incidents RETURNING 1) SELECT count(*) FROM deleted"
+                    )
+                    await conn.execute(
+                        "INSERT INTO audit_events(actor,action,entity_type,entity_id,metadata) "
+                        "VALUES($1,'RESET_DEMO_DATA','demo','all',$2::jsonb)",
+                        actor,
+                        json.dumps({
+                            "notifications_deleted": notifications_deleted,
+                            "readings_deleted": readings_deleted,
+                            "incidents_deleted": incidents_deleted,
+                        }),
+                    )
+            critical_simulation_last_trigger.clear()
 
     await broadcast()
     return {
-        "message": "Demo data reset successfully",
+        "message": "All simulation data reset successfully",
         "simulator_running": False,
         "deleted": {
             "readings": readings_deleted,
@@ -453,7 +457,9 @@ async def critical_simulation(body: SimulationCriticalRequest, request: Request)
         if not simulator_enabled:
             simulator_enabled = True
             simulator_task = asyncio.create_task(simulator_loop())
-    asyncio.create_task(broadcast())
+    # The client refreshes persisted state after this committed response. The
+    # simulator's first normal tick broadcasts the next update, avoiding a
+    # duplicate immediate WebSocket frame.
     return {"zone_id": body.zone_id, "reading": value, "status": "CRITICAL"}
 
 

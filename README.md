@@ -14,7 +14,7 @@ FastAPI + asyncpg (one worker; simulator is process-local)
 Supabase PostgreSQL
 ```
 
-The frontend never writes readings or makes threshold decisions. Read APIs remain public for the read-only dashboard. Local development defaults to no sign-in only for loopback clients; privileged requests from other hosts require strong configured credentials. Production requires operator sign-in using a signed HTTP-only cookie with an eight-hour session, HTTPS, and an exact HTTPS origin allowlist. The live WebSocket also requires an authorized session and an allowed origin. Mutation requests require an allowed Origin from non-loopback clients. Browsers that block third-party cookies may need the frontend and backend on custom subdomains of the same site. Use a single backend instance/worker: the simulator is guarded to one loop in one process. The simulator automatically stops after its configured maximum runtime. Do not horizontally scale it without replacing that guard with a database/advisory lock and a dedicated scheduler.
+The frontend never writes readings or makes threshold decisions. Read APIs remain public for the read-only dashboard. Local development defaults to no sign-in only for loopback clients; privileged requests from other hosts require strong configured credentials. Production privileged routes require a signed HTTP-only cookie with an eight-hour session, HTTPS, and an exact HTTPS origin allowlist. The dashboard intentionally has no sign-in controls; without an authorized session it remains view-only and its operator controls stay disabled. Do not disable backend authentication to make a public presentation interactive. The live WebSocket also requires an authorized session and an allowed origin. Mutation requests require an allowed Origin from non-loopback clients. Browsers that block third-party cookies may need the frontend and backend on custom subdomains of the same site. Use a single backend instance/worker: the simulator is guarded to one loop in one process. The simulator automatically stops after its configured maximum runtime. Do not horizontally scale it without replacing that guard with a database/advisory lock and a dedicated scheduler.
 
 ### Default zones
 
@@ -45,16 +45,16 @@ Prerequisites: Python 3.12, Node.js 20+, npm, and a Supabase project (or compati
    GRANT USAGE, SELECT ON SEQUENCE readings_id_seq, audit_events_id_seq TO gas_monitor_app;
    ```
 
-   Store the password in a secret manager, then use this role in `DATABASE_URL`. For a **separate development/test database only**, the demo reset endpoint also needs this least-scope grant:
+   Store the password in a secret manager, then use this role in `DATABASE_URL`. Reset All Data transactionally deletes only readings, incidents, and notifications while preserving zones, settings, and audit events. If you intend to enable this operation in production, the dedicated backend role also needs this least-scope grant; do not apply it automatically:
 
    ```sql
    GRANT DELETE ON readings, incidents, notifications TO gas_monitor_app;
    ```
 
-   Never grant this permission to a production database role. The reset route is unavailable when `APP_ENV=production`; use distinct database credentials for development and production. Do not grant `TRUNCATE`, schema ownership, or DDL.
+   Grant `DELETE` only when the authenticated production reset feature is intentionally required. The operation is destructive and is recorded in `audit_events`; the API still requires an authorized operator and allowed origin. Do not grant `TRUNCATE`, schema ownership, or DDL. Use distinct database credentials for development and production.
 
    The migrations do not configure Supabase Data API grants or RLS. Before exposing the Supabase project, verify effective Data API grants and prevent `anon`/`authenticated` direct table access unless intentionally required. If enabling RLS, ensure the dedicated backend database role still has narrowly scoped access through grants and policies. The application connects from the backend using its dedicated PostgreSQL role; it does not need a Supabase service-role key in the frontend.
-4. Copy `backend/.env.example` to `backend/.env`. For a local loopback demo, keep `APP_ENV=development`, `AUTH_REQUIRED=false`, `SMS_MODE=mock`, and `SMS_ENABLED=false`. No-login controls and WebSocket access work only for loopback clients. The simulator stops after `SIMULATOR_MAX_RUNTIME_SECONDS` (default 900; maximum 3600), and critical simulations for one zone have a short cooldown. Keep credentials out of source control.
+4. Copy `backend/.env.example` to `backend/.env`. For a local loopback demo, keep `APP_ENV=development`, `AUTH_REQUIRED=false`, `SMS_MODE=mock`, and `SMS_ENABLED=false`. No-login controls and WebSocket access work only for loopback clients. The simulator interval defaults to 0.35 seconds and can be adjusted with `SIMULATOR_INTERVAL_SECONDS` (0.25–10 seconds); it stops after `SIMULATOR_MAX_RUNTIME_SECONDS` (default 900; maximum 3600), and critical simulations for one zone have a short cooldown. Keep credentials out of source control.
 5. Install and run the API (PowerShell):
 
    ```powershell
@@ -74,7 +74,7 @@ Prerequisites: Python 3.12, Node.js 20+, npm, and a Supabase project (or compati
    npm run dev
    ```
 
-   Open the Vite URL shown (normally `http://localhost:5173`). With the local example settings, loopback controls work without sign-in. To exercise operator login locally, set `AUTH_REQUIRED=true` and configure credentials. Read-only dashboard/history remains public. The simulator stops when the common Stop control is used, the API process shuts down, or its maximum runtime is reached. Starting it again does not clear readings, incidents, or notifications.
+   Open the Vite URL shown (normally `http://localhost:5173`). With the local example settings, loopback controls work without sign-in. The dashboard has no sign-in UI; if `AUTH_REQUIRED=true`, operator actions require a session provisioned through an approved trusted workflow and remain unavailable from this UI. Read-only dashboard/history remains public. The simulator stops when the common Stop control is used, the API process shuts down, or its maximum runtime is reached. Starting it again does not clear readings, incidents, or notifications.
 
 ## API overview
 
@@ -107,7 +107,7 @@ Before the owner separately authorizes and configures real messages, confirm cur
 
 ## Tests and build
 
-From `backend/`, with its virtual environment active: `python -m pytest`. Unit tests cover classification boundaries, gas-specific thresholds, per-zone critical events, incident deduplication/escalation, mock and provider-failure notification behavior, login authorization, simulator start/stop controls, request validation, reading/incident write calls, and demo-reset scope/environment restrictions. They use fake database connections; persistence against a real PostgreSQL instance still needs an integration environment. Frontend production build: from `frontend/`, run `npm ci`, then `npm run build`.
+From `backend/`, with its virtual environment active: `python -m pytest`. Unit tests cover classification boundaries, gas-specific thresholds, per-zone critical events, incident deduplication/escalation, mock and provider-failure notification behavior, authentication, simulator single-loop start/stop controls, request validation, reading/incident writes, and reset authorization/scope. They use fake database connections; persistence against a real PostgreSQL instance still needs an integration environment. Frontend production build: from `frontend/`, run `npm ci`, then `npm run build`.
 
 ## Deployment
 
@@ -116,7 +116,7 @@ This repository does **not** deploy services, create cloud resources, or send SM
 1. **Supabase:** create the project and apply migrations `001_initial.sql` and `002_severity_notifications.sql`, in that order. Use a database password that is not reused elsewhere. Configure network access and TLS for the backend host; never expose this URL or a Supabase service-role key to Vite.
 2. **Backend:** deploy the `backend/` directory to Render (or another Python ASGI host) using [`backend/render.yaml`](backend/render.yaml): install `requirements.lock`, start `uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1`. Set `DATABASE_URL`, `SESSION_SECRET`, `ADMIN_USERNAME`, `ADMIN_PASSWORD`, and `CORS_ORIGINS` in the host's secret environment settings. Use a unique session secret of at least 32 characters, a non-default username, and a password of at least 16 characters. `CORS_ORIGINS` must be a comma-separated exact list of HTTPS frontend origins without paths. The manifest keeps `AUTH_REQUIRED=true`, caps simulation at 900 seconds (configurable up to 3600), and explicitly keeps SMS mock/disabled. Configure persistent host availability appropriate to the presentation and confirm its current free-plan sleep, runtime, connection, and usage limits; free tiers may sleep or change and do not guarantee continuous monitoring.
 3. **Vercel:** import the repository and set the project root directory to `frontend`. Build command `npm run build`, output directory `dist`. Set `VITE_API_BASE_URL` to the deployed backend origin (no secret), then deploy through Vercel. Add the final Vercel origin to backend `CORS_ORIGINS` and redeploy/restart the backend.
-4. Check `https://<backend>/api/health`, open `https://<backend>/docs`, then verify the dashboard connection, login, simulator start/stop, zone-specific critical event, incident actions, and notification history. Test only with SMS disabled.
+4. Check `https://<backend>/api/health`, open `https://<backend>/docs`, then verify the dashboard connection and read-only state. Operator actions require an authorized session; the frontend intentionally does not provide a sign-in control. Test only with SMS disabled.
 5. Enabling real SMS is a separate owner decision after provider account, approved configuration, credentials, pricing and telecom compliance have been verified. It is intentionally outside deployment automation.
 
 ## Configuration reference
