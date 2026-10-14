@@ -193,8 +193,6 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Real-Time Industrial Gas Monitoring and Alert System API", version="1.0.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=settings.allowed_origins, allow_credentials=True,
-                   allow_methods=["GET", "POST", "PUT", "DELETE"], allow_headers=["Content-Type"])
 
 
 @app.middleware("http")
@@ -207,6 +205,18 @@ async def check_mutation_origin(request: Request, call_next):
         if origin and origin not in {*settings.allowed_origins, own_origin}:
             return JSONResponse(status_code=403, content={"detail": "Origin is not allowed"})
     return await call_next(request)
+
+
+# Add CORS after the origin guard so Starlette places it outermost. This ensures
+# browser preflights are handled before route/auth checks and CORS headers are
+# present even on origin-guard or authentication error responses.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.allowed_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Accept", "Authorization", "Content-Type"],
+)
 
 
 @app.get("/api/health")
