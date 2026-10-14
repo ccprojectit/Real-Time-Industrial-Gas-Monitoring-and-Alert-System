@@ -53,3 +53,22 @@ td{font-size:13px;padding:12px 10px}
 @media(max-width:1100px){.control-actions{margin-top:12px;justify-content:flex-start;flex-wrap:wrap}}
 .access-note{flex-basis:100%;margin:4px 0 0 48px;color:#7b8796;font-size:12px;line-height:1.45}
 @media(max-width:760px){.access-note{margin-left:0}.control-panel{align-items:flex-start}.control-actions{width:100%}}
+.access-note{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.access-action{min-height:32px;padding:6px 10px;border:1px solid #cfdae8;border-radius:6px;background:#f8fbff;font-weight:700}
+.auth-button{height:36px}
+.auth-backdrop{position:fixed;inset:0;z-index:20;display:grid;place-items:center;padding:18px;background:#12203366;backdrop-filter:blur(2px)}
+.auth-dialog{width:min(100%,410px);padding:24px;border:1px solid #e3e9f0;border-radius:13px;background:#fff;box-shadow:0 20px 65px #17243835;color:#26364b}
+.auth-dialog-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:15px}
+.auth-dialog-icon{width:40px;height:40px;display:grid;place-items:center;border-radius:10px;background:#edf5ff;color:#2868b7}
+.auth-close{width:34px;height:34px;display:grid;place-items:center;border:1px solid #e5eaf0;border-radius:7px;background:#fff;color:#6e7c8e}
+.auth-dialog h2{margin:0;font-family:Manrope,sans-serif;font-size:21px;font-weight:800;color:#1d2b40}
+.auth-dialog>p{margin:7px 0 18px}
+.auth-dialog form{display:grid;gap:13px}
+.auth-dialog form label{display:grid;gap:6px;font-size:12px;font-weight:700;color:#4a5a70}
+.auth-dialog input{height:42px;width:100%;padding:0 11px;border:1px solid #d6dee8;border-radius:7px;background:#fff;color:#24344a;outline:none}
+.auth-dialog input:focus{border-color:#5b91ce;box-shadow:0 0 0 3px #3275c71c}
+.auth-dialog-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:5px}
+.auth-security-note{display:block;margin-top:16px;color:#8490a0;font-size:11px;line-height:1.5}
+.auth-error{display:flex;align-items:flex-start;gap:8px;margin:0 0 14px;padding:10px;border:1px solid #f0d4d2;border-radius:7px;background:#fff3f2;color:#a3443d;font-size:12px;line-height:1.45}
+.auth-error svg{flex:none;margin-top:1px}
+@media(max-width:760px){.auth-button{font-size:0;width:36px;padding:0}.auth-button svg{flex:none}.auth-dialog{padding:20px}}

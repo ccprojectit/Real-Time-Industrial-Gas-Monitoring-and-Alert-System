@@ -114,9 +114,15 @@ def test_preflight_does_not_bypass_operator_authentication(monkeypatch):
         assert login.status_code == 200
         cookie = login.headers["set-cookie"].lower()
         assert "secure" in cookie and "httponly" in cookie and "samesite=none" in cookie
+        session = client.get("/api/auth/session", headers=headers)
+        assert session.status_code == 200
+        assert session.json()["authenticated"] is True
+        assert session.json()["auth_required"] is True
 
         started = client.post("/api/simulation/start", headers=headers, json={})
         assert started.status_code == 200
         assert started.headers["access-control-allow-origin"] == PRODUCTION_ORIGIN
         stopped = client.post("/api/simulation/stop", headers=headers, json={})
         assert stopped.status_code == 200
+        assert client.post("/api/auth/logout", headers=headers).status_code == 200
+        assert client.get("/api/auth/session", headers=headers).json()["authenticated"] is False
