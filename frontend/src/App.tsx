@@ -103,8 +103,17 @@ export default function App() {
         setSuccess(result.message||'All simulation data reset successfully.')
       } else if(path.includes('/api/incidents/')){
         const id=path.split('/')[3]
-        setState(s=>({...s,incidents:s.incidents.map(i=>i.incident_id===id?{...i,...result}:i)}))
-        setSuccess(path.endsWith('/acknowledge')?'Incident acknowledged.':'Incident resolved.')
+        const recovery=result.recovery_reading as {zone_id:number;reading:number;unit:string;status:'NORMAL';measured_at:string}|undefined
+        if(recovery){
+          const zone=zonesRef.current.find(z=>z.id===recovery.zone_id)
+          if(zone){
+            const updated={...zone,current_reading:recovery.reading,previous_reading:zone.current_reading,last_updated:recovery.measured_at,status:'NORMAL' as const,active_incident_id:null}
+            zonesRef.current=zonesRef.current.map(item=>item.id===zone.id?updated:item)
+            const reading:Reading={id:Date.parse(recovery.measured_at),zone_id:zone.id,zone_name:zone.name,gas_name:zone.gas_name,value:Number(recovery.reading),unit:recovery.unit,measured_at:recovery.measured_at}
+            setState(s=>({...s,incidents:s.incidents.map(i=>i.incident_id===id?{...i,...result}:i),zones:s.zones.map(item=>item.id===zone.id?updated:item),readings:[...s.readings.filter(item=>!(item.zone_id===zone.id&&item.measured_at===reading.measured_at)),reading].slice(-1000)}))
+          }
+        }else setState(s=>({...s,incidents:s.incidents.map(i=>i.incident_id===id?{...i,...result}:i)}))
+        setSuccess(path.endsWith('/acknowledge')?'Incident acknowledged.':'Incident resolved. Zone reading returned to Normal.')
       } else if(path==='/api/simulation/start'||path==='/api/simulation/stop'){
         setState(s=>({...s,simulator:!!result.simulator_running}))
         setSuccess(result.simulator_running?'Simulation started.':'Simulation stopped.')

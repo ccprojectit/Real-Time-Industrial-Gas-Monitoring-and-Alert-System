@@ -448,9 +448,11 @@ async def reset_demo_data(request: Request):
 async def critical_simulation_for_zones(zone_ids: list[int], actor: str) -> list[dict]:
     if not zone_ids or len(zone_ids) != len(set(zone_ids)):
         raise HTTPException(422, "Select one or more distinct zone identifiers")
-    measured_at = datetime.now(timezone.utc)
     created = []
     async with simulator_control_lock:
+        # Timestamp only after any in-flight tick has completed, so ordering by
+        # measured_at and database insertion order agree for the critical event.
+        measured_at = datetime.now(timezone.utc)
         now = asyncio.get_running_loop().time()
         for zone_id in zone_ids:
             check_critical_simulation_cooldown(zone_id, now)
@@ -477,6 +479,12 @@ async def critical_simulation_for_zones(zone_ids: list[int], actor: str) -> list
                                     "measured_at": measured_at.isoformat()})
         for zone_id in zone_ids:
             critical_simulation_last_trigger[zone_id] = now
+        # Critical readings are intentionally latched and continue rising on
+        # simulator ticks, so triggering Critical also starts the shared loop.
+        global simulator_task, simulator_enabled
+        if not simulator_enabled:
+            simulator_enabled = True
+            simulator_task = asyncio.create_task(simulator_loop())
     # Push the committed state to other connected dashboards immediately. The
     # initiating dashboard also applies the confirmed reading from this response.
     asyncio.create_task(broadcast())
@@ -498,16 +506,31 @@ async def critical_simulation_batch(body: SimulationCriticalBatchRequest, reques
 
 async def change_incident(incident_id: str, actor: str, action: str):
     column, state = ("acknowledged_at", "ACKNOWLEDGED") if action == "acknowledge" else ("resolved_at", "RESOLVED")
-    async with require_pool().acquire() as conn:
-        async with conn.transaction():
-            row = await conn.fetchrow(f"UPDATE incidents SET {column}=COALESCE({column},now()),{column.replace('_at','_by')}=COALESCE({column.replace('_at','_by')},$2),state=$3 WHERE id=$1 AND state <> 'RESOLVED' RETURNING *", incident_id, actor, state)
-            if not row:
-                exists = await conn.fetchval("SELECT 1 FROM incidents WHERE id=$1", incident_id)
-                if not exists:
-                    raise HTTPException(404, "Incident not found")
-                raise HTTPException(409, "Incident is already resolved")
-            await conn.execute("INSERT INTO audit_events(actor,action,entity_type,entity_id) VALUES($1,$2,'incident',$3)", actor, action.upper(), incident_id)
-            return api_json(dict(row))
+    recovery_reading = None
+    async with simulator_control_lock:
+        async with require_pool().acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(f"UPDATE incidents SET {column}=COALESCE({column},now()),{column.replace('_at','_by')}=COALESCE({column.replace('_at','_by')},$2),state=$3 WHERE id=$1 AND state <> 'RESOLVED' RETURNING *", incident_id, actor, state)
+                if not row:
+                    exists = await conn.fetchval("SELECT 1 FROM incidents WHERE id=$1", incident_id)
+                    if not exists:
+                        raise HTTPException(404, "Incident not found")
+                    raise HTTPException(409, "Incident is already resolved")
+                await conn.execute("INSERT INTO audit_events(actor,action,entity_type,entity_id) VALUES($1,$2,'incident',$3)", actor, action.upper(), incident_id)
+                if action == "resolve" and row["severity"] == "CRITICAL":
+                    zone = await conn.fetchrow("SELECT id,unit,critical_threshold,normal_min,normal_max FROM zones WHERE id=$1 FOR UPDATE", row["zone_id"])
+                    if zone is None:
+                        raise HTTPException(404, "Incident zone not found")
+                    value = simulation_reading(zone, None)
+                    measured_at = datetime.now(timezone.utc)
+                    await conn.execute("INSERT INTO readings(zone_id,value,unit,measured_at) VALUES($1,$2,$3,$4)",
+                                       zone["id"], value, zone["unit"], measured_at)
+                    recovery_reading = {"zone_id": zone["id"], "reading": value, "unit": zone["unit"],
+                                        "status": "NORMAL", "measured_at": measured_at.isoformat()}
+                result = api_json(dict(row))
+                if recovery_reading:
+                    result["recovery_reading"] = recovery_reading
+                return result
 
 
 @app.post("/api/incidents/{incident_id}/acknowledge")

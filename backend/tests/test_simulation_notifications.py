@@ -219,7 +219,7 @@ def test_critical_api_persists_immediately_and_rejects_rapid_duplicate(monkeypat
         assert len(pool.conn.readings) == 1
         assert len(pool.conn.created) == 1
         assert notified[0][1] == "CRITICAL"
-        assert len(created_tasks) == 1  # immediate WebSocket broadcast; critical trigger does not start simulation
+        assert len(created_tasks) == 2  # shared simulator loop and immediate WebSocket broadcast
         with pytest.raises(main.HTTPException) as error:
             await main.critical_simulation(main.SimulationCriticalRequest(zone_id=1), request)
         assert error.value.status_code == 429
@@ -252,7 +252,7 @@ def test_multi_zone_critical_creates_records_only_for_selected_zones_and_dedupli
 
     async def run():
         result=await main.critical_simulation_batch(main.SimulationCriticalBatchRequest(zone_ids=[1,3]),request)
-        assert result["simulator_running"] is False
+        assert result["simulator_running"] is True
         assert {item["zone_id"] for item in result["zones"]}=={1,3}
         assert len(conn.readings)==len(conn.incidents)==len(conn.notifications)==2
         for reading in conn.readings:
@@ -260,7 +260,7 @@ def test_multi_zone_critical_creates_records_only_for_selected_zones_and_dedupli
             assert reading["value"]>zone["critical_threshold"]
         assert {item["zone_id"] for item in conn.readings}=={1,3}
         assert all(item["status"]=="MOCK_RECORDED" and item["mode"]=="mock" for item in conn.notifications)
-        assert len(created)==1  # one immediate WebSocket broadcast; no simulator auto-start
+        assert len(created)==2  # shared simulator loop and immediate WebSocket broadcast
         with pytest.raises(main.HTTPException) as repeated:
             await main.critical_simulation_batch(main.SimulationCriticalBatchRequest(zone_ids=[1,3]),request)
         assert repeated.value.status_code==429
@@ -670,28 +670,34 @@ def test_remote_production_mutations_require_an_allowed_origin(monkeypatch):
         assert denied_session.status_code == 401
 
 
-def test_acknowledge_and_resolve_record_actor_without_touching_zone_state(monkeypatch):
+def test_acknowledge_records_actor_and_resolve_returns_critical_zone_to_normal(monkeypatch):
     class Tx:
         async def __aenter__(self): return self
         async def __aexit__(self, *_): return False
 
     class Conn:
         def __init__(self):
-            self.incident = {"id":"event-1", "state":"OPEN", "acknowledged_at":None,
+            self.incident = {"id":"event-1", "zone_id":1, "severity":"CRITICAL", "state":"OPEN", "acknowledged_at":None,
                              "acknowledged_by":None, "resolved_at":None, "resolved_by":None}
             self.audit = []
             self.statements = []
+            self.readings = []
         def transaction(self): return Tx()
         async def fetchrow(self, sql, *args):
             self.statements.append(sql)
             if sql.startswith("UPDATE incidents SET"):
-                assert "zones" not in sql.lower()
                 column, state = ("acknowledged", "ACKNOWLEDGED") if "acknowledged_at" in sql else ("resolved", "RESOLVED")
                 self.incident.update({"state":state, f"{column}_at":"recorded", f"{column}_by":args[1]})
                 return dict(self.incident)
+            if sql.startswith("SELECT id,unit,critical_threshold"):
+                return {"id":1,"unit":"ppm","critical_threshold":100,"normal_min":0,"normal_max":12}
             raise AssertionError(sql)
         async def fetchval(self, *_): return None
-        async def execute(self, sql, *args): self.audit.append(args)
+        async def execute(self, sql, *args):
+            if sql.startswith("INSERT INTO readings"):
+                self.readings.append(args)
+            else:
+                self.audit.append(args)
 
     class Pool:
         def __init__(self): self.conn = Conn()
@@ -706,10 +712,15 @@ def test_acknowledge_and_resolve_record_actor_without_touching_zone_state(monkey
         ack = await main.change_incident("event-1", "operator-test", "acknowledge")
         assert ack["state"] == "ACKNOWLEDGED"
         assert ack["acknowledged_by"] == "operator-test"
+        assert "recovery_reading" not in ack
+        assert pool.conn.readings == []
         resolved = await main.change_incident("event-1", "operator-test", "resolve")
         assert resolved["state"] == "RESOLVED"
         assert resolved["resolved_by"] == "operator-test"
         assert resolved["acknowledged_at"] == "recorded"
+        assert resolved["recovery_reading"]["status"] == "NORMAL"
+        assert resolved["recovery_reading"]["reading"] < 100
+        assert len(pool.conn.readings) == 1
         assert len(pool.conn.audit) == 2
 
     asyncio.run(run())
