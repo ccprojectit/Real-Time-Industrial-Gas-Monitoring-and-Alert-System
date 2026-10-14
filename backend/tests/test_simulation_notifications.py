@@ -140,11 +140,14 @@ def test_critical_api_persists_immediately_and_rejects_rapid_duplicate(monkeypat
 
     async def run():
         first = await main.critical_simulation(main.SimulationCriticalRequest(zone_id=1), request)
-        assert first == {"zone_id":1, "reading":108.0, "status":"CRITICAL"}
+        assert first["zone_id"] == 1
+        assert first["reading"] == 108.0
+        assert first["status"] == "CRITICAL"
+        assert datetime.fromisoformat(first["measured_at"]).tzinfo is not None
         assert len(pool.conn.readings) == 1
         assert len(pool.conn.created) == 1
         assert notified[0][1] == "CRITICAL"
-        assert len(created_tasks) == 1
+        assert len(created_tasks) == 2  # simulator loop plus immediate WebSocket broadcast
         with pytest.raises(main.HTTPException) as error:
             await main.critical_simulation(main.SimulationCriticalRequest(zone_id=1), request)
         assert error.value.status_code == 429
@@ -382,6 +385,47 @@ def test_simulator_stops_after_configured_maximum_runtime(monkeypatch):
     asyncio.run(run())
     assert main.simulator_enabled is False
     assert main.simulator_task is None
+
+
+def test_simulator_batches_zone_readings_in_one_database_write(monkeypatch):
+    zones = [
+        {"id": zone_id, "name": f"Zone {zone_id}", "gas_name": "Gas", "unit": "ppm",
+         "warning_threshold": 50, "critical_threshold": 100, "normal_min": 0, "normal_max": 20,
+         "prior_reading": 5, "critical_latched": False}
+        for zone_id in range(1, 5)
+    ]
+
+    class Tx:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return False
+
+    class Conn:
+        def __init__(self): self.batch = []
+        def transaction(self): return Tx()
+        async def fetch(self, _sql): return zones
+        async def executemany(self, _sql, rows): self.batch = list(rows)
+        async def fetchval(self, *_args): return None
+
+    class Pool:
+        def __init__(self): self.conn = Conn()
+        def acquire(self): return self
+        async def __aenter__(self): return self.conn
+        async def __aexit__(self, *_): return False
+
+    pool = Pool()
+    monkeypatch.setattr(main, "require_pool", lambda: pool)
+    monkeypatch.setattr(main, "simulator_enabled", True)
+    monkeypatch.setattr(main, "simulator_task", None)
+    monkeypatch.setattr(main, "broadcast", lambda: asyncio.sleep(0))
+
+    async def end_after_one_cycle(_delay):
+        main.simulator_enabled = False
+
+    monkeypatch.setattr(main.asyncio, "sleep", end_after_one_cycle)
+    asyncio.run(main.simulator_loop())
+
+    assert len(pool.conn.batch) == 4
+    assert {row[0] for row in pool.conn.batch} == {1, 2, 3, 4}
 
 
 def test_unauthenticated_local_demo_can_start_and_stop_simulation(monkeypatch):

@@ -13,7 +13,7 @@ type State = { zones:Zone[]; readings:Reading[]; incidents:Incident[]; notificat
 async function api<T>(path:string, options:RequestInit = {}):Promise<T> {
   const headers=new Headers(options.headers)
   if(options.body!=null&&!headers.has('Content-Type'))headers.set('Content-Type','application/json')
-  const res = await fetch(`${API}${path}`, { ...options, credentials:'include', headers })
+  const res = await fetch(`${API}${path}`, { ...options, credentials:'include', cache:'no-store', headers })
   if (!res.ok) { const body = await res.json().catch(()=>({})); throw new Error(body.detail || `Request failed (${res.status})`) }
   return res.json()
 }
@@ -49,7 +49,33 @@ export default function App() {
       setState(s=>({...s,incidents,notifications}))
     } catch { /* The next WebSocket event or fallback poll can retry. */ }
   },[])
-  useEffect(()=>{ void refresh(); const timer=setInterval(()=>{setNow(new Date());if(!wsConnected.current)void refresh()},2000); return()=>clearInterval(timer) },[refresh])
+  useEffect(()=>{
+    let active=true, inFlight=false, pollTimer=0
+    void refresh()
+    const poll=async()=>{
+      setNow(new Date())
+      if(!wsConnected.current&&!inFlight){
+        inFlight=true
+        try{
+          const [live,history]=await Promise.all([
+            api<{simulator_running:boolean;zones:Zone[]}>('/api/state'),
+            api<Reading[]>(`/api/readings?zone_id=${chartZone}&limit=80`)
+          ])
+          if(!active)return
+          const previous=zonesRef.current
+          const changed=live.zones.some(z=>{const old=previous.find(p=>p.id===z.id);return old&&(old.status!==z.status||old.active_incident_id!==z.active_incident_id)})
+          zonesRef.current=live.zones
+          setState(s=>({...s,zones:live.zones,readings:[...s.readings.filter(r=>r.zone_id!==chartZone),...history].slice(-1000),simulator:live.simulator_running,health:'connected'}))
+          if(changed)void refreshHistory()
+        }catch{
+          if(active)setState(s=>({...s,health:'disconnected'}))
+        }finally{inFlight=false}
+      }
+      if(active)pollTimer=window.setTimeout(poll,state.simulator?500:2000)
+    }
+    pollTimer=window.setTimeout(poll,0)
+    return()=>{active=false;window.clearTimeout(pollTimer)}
+  },[refresh,refreshHistory,chartZone,state.simulator])
   useEffect(()=>{
     if(state.authRequired&&!state.authenticated)return
     if (!('WebSocket' in window)) return
@@ -68,9 +94,9 @@ export default function App() {
     try {
       const result=await api<Record<string,any>>(path,{method:'POST',body:body?JSON.stringify(body):undefined})
       if(path==='/api/demo/reset'){
-        setState(s=>({...s,readings:[],incidents:[],notifications:[],simulator:false,zones:s.zones.map(z=>({...z,current_reading:null,previous_reading:null,last_updated:null,active_incident_id:null,status:'NORMAL'}))}))
-        const refreshed=await refresh()
-        setSuccess(refreshed?(result.message||'All simulation data reset successfully.'):'Data reset succeeded, but the dashboard could not refresh. Reload the page.')
+        zonesRef.current=zonesRef.current.map(z=>({...z,current_reading:null,previous_reading:null,last_updated:null,active_incident_id:null,status:'NORMAL'}))
+        setState(s=>({...s,readings:[],incidents:[],notifications:[],simulator:false,zones:zonesRef.current}))
+        setSuccess(result.message||'All simulation data reset successfully.')
       } else if(path.includes('/api/incidents/')){
         const id=path.split('/')[3]
         setState(s=>({...s,incidents:s.incidents.map(i=>i.incident_id===id?{...i,...result}:i)}))
@@ -79,13 +105,19 @@ export default function App() {
         setState(s=>({...s,simulator:!!result.simulator_running}))
         setSuccess(result.simulator_running?'Simulation started.':'Simulation stopped.')
       } else if(path==='/api/simulation/critical'){
-        const refreshed=await refresh()
-        setSuccess(refreshed?'Critical reading and incident recorded.':'Critical event recorded; dashboard refresh is pending.')
+        const zone=zonesRef.current.find(z=>z.id===result.zone_id)
+        if(zone&&result.measured_at){
+          const reading:Reading={id:Date.parse(result.measured_at),zone_id:zone.id,zone_name:zone.name,gas_name:zone.gas_name,value:Number(result.reading),unit:zone.unit,measured_at:result.measured_at}
+          const updated={...zone,current_reading:Number(result.reading),previous_reading:zone.current_reading,last_updated:result.measured_at,status:result.status,active_incident_id:zone.active_incident_id}
+          zonesRef.current=zonesRef.current.map(item=>item.id===zone.id?updated:item)
+          setState(s=>({...s,zones:s.zones.map(item=>item.id===zone.id?updated:item),readings:[...s.readings.filter(item=>!(item.zone_id===reading.zone_id&&item.measured_at===reading.measured_at)),reading].slice(-1000),simulator:true}))
+        }
+        void refreshHistory()
+        setSuccess('Critical reading recorded.')
       }
     } catch(e) {
       const message=e instanceof Error?e.message:'Action failed'
       if(message.toLowerCase().includes('authentication'))setState(s=>({...s,authenticated:false,authRequired:true}))
-      await refresh()
       setError(message)
     } finally {setBusy('')}
   }
@@ -107,9 +139,9 @@ export default function App() {
       <section className="section-heading"><div><h3>Monitoring zones</h3></div></section>
       <section className="zone-grid">{state.zones.length===0?<div className="empty-panel">{state.health==='disconnected'?'Waiting for backend connection. Start the API and configure the database.':'Loading zone configuration…'}</div>:state.zones.map(zone=><ZoneCard key={zone.id} zone={zone}/>)}</section>
       <section className="control-panel"><div className="control-copy"><div className="control-icon"><Gauge size={18}/></div><div><h3>Simulation controls</h3><p className="muted">Start or stop readings across all zones, or trigger a critical event for one zone.</p></div></div><div className="control-actions"><button className="btn btn-primary" disabled={!canOperate||!!busy||state.simulator} onClick={()=>requestAction('start','/api/simulation/start')}><Activity size={16}/>{busy==='start'?'Starting…':'Start simulation'}</button><button className="btn btn-outline" disabled={!canOperate||!!busy||!state.simulator} onClick={()=>requestAction('stop','/api/simulation/stop')}><span className="stop-square"/>{busy==='stop'?'Stopping…':'Stop simulation'}</button><div className="critical-action"><select aria-label="Critical simulation zone" value={criticalZone} onChange={e=>setCriticalZone(Number(e.target.value))}>{state.zones.map(z=><option key={z.id} value={z.id}>{z.name} · {z.formula}</option>)}</select><button className="btn btn-danger" disabled={!canOperate||!!busy||!state.zones.length} onClick={()=>requestAction('critical','/api/simulation/critical',{zone_id:criticalZone})}><Siren size={16}/>{busy==='critical'?'Triggering…':'Critical simulation'}</button></div><button className="btn btn-light reset-button" disabled={!canOperate||!!busy||!state.zones.length} onClick={confirmDemoReset}><RotateCcw size={15}/>{busy==='reset'?'Resetting…':'Reset All Data'}</button></div>{!canOperate&&<p className="access-note">Live monitoring is available. Operator controls require an authorized session.</p>}</section>
-      <section className="content-grid"><div className="panel chart-panel"><div className="panel-head"><div><h3>Reading history</h3><p className="muted">Recent concentration readings for the selected zone</p></div><label className="select-wrap"><select value={chartZone} onChange={e=>setChartZone(Number(e.target.value))}>{state.zones.map(z=><option key={z.id} value={z.id}>{z.name} · {z.formula}</option>)}</select><ChevronDown size={14}/></label></div><div className="chart-meta"><span><span className="legend-dot"/> {selectedZone?.gas_name||'Gas'} concentration</span><span>Unit: <strong>{selectedZone?.unit||'—'}</strong></span></div><div className="chart-area">{chart.length<2?<div className="chart-empty"><Activity size={21}/><span>{state.simulator?'Collecting readings…':'Start the simulation to generate live readings.'}</span></div>:<ResponsiveContainer width="100%" height="100%"><LineChart data={chart} margin={{top:10,right:12,left:0,bottom:0}}><CartesianGrid stroke="#edf0f4" vertical={false}/><XAxis dataKey="time" tick={{fontSize:10,fill:'#8993a2'}} tickLine={false} axisLine={false} minTickGap={35}/><YAxis tick={{fontSize:10,fill:'#8993a2'}} tickLine={false} axisLine={false} width={42}/><Tooltip contentStyle={{border:'1px solid #e7ebf0',borderRadius:8,fontSize:12}} formatter={(v)=>[`${v} ${selectedZone?.unit||''}`,'Reading']}/>{selectedZone&&<><Line dataKey="value" type="monotone" stroke="#3275c7" strokeWidth={2.5} dot={false} activeDot={{r:4}} isAnimationActive={false}/></>}</LineChart></ResponsiveContainer>}</div><div className="chart-footer"><span><span className="tiny-line"/> Reading</span><span><span className="tiny-dash warning-line"/> Warning threshold {selectedZone?.warning_threshold??'—'} {selectedZone?.unit}</span><span><span className="tiny-dash critical-line"/> Critical threshold {selectedZone?.critical_threshold??'—'} {selectedZone?.unit}</span></div></div>
+      <section className="content-grid"><div className="panel chart-panel"><div className="panel-head"><div><h3>Reading history</h3><p className="muted">Recent concentration readings for the selected zone</p></div><label className="select-wrap"><select value={chartZone} onChange={e=>setChartZone(Number(e.target.value))}>{state.zones.map(z=><option key={z.id} value={z.id}>{z.name} · {z.formula}</option>)}</select><ChevronDown size={14}/></label></div><div className="chart-meta"><span><span className="legend-dot"/> {selectedZone?.gas_name||'Gas'} concentration</span><span>Unit: <strong>{selectedZone?.unit||'—'}</strong></span></div><div className="chart-area">{chart.length===0?<div className="chart-empty"><Activity size={21}/><span>{state.simulator?'Waiting for the first reading…':'No readings yet. Start the simulation to generate history.'}</span></div>:<ResponsiveContainer width="100%" height="100%"><LineChart data={chart} margin={{top:10,right:12,left:0,bottom:0}}><CartesianGrid stroke="#edf0f4" vertical={false}/><XAxis dataKey="time" tick={{fontSize:10,fill:'#8993a2'}} tickLine={false} axisLine={false} minTickGap={35}/><YAxis tick={{fontSize:10,fill:'#8993a2'}} tickLine={false} axisLine={false} width={42}/><Tooltip contentStyle={{border:'1px solid #e7ebf0',borderRadius:8,fontSize:12}} formatter={(v)=>[`${v} ${selectedZone?.unit||''}`,'Reading']}/>{selectedZone&&<><Line dataKey="value" type="monotone" stroke="#3275c7" strokeWidth={2.5} dot={chart.length===1?{r:4}:false} activeDot={{r:4}} isAnimationActive={false}/></>}</LineChart></ResponsiveContainer>}</div><div className="chart-footer"><span><span className="tiny-line"/> Reading</span><span><span className="tiny-dash warning-line"/> Warning threshold {selectedZone?.warning_threshold??'—'} {selectedZone?.unit}</span><span><span className="tiny-dash critical-line"/> Critical threshold {selectedZone?.critical_threshold??'—'} {selectedZone?.unit}</span></div></div>
       <div className="panel notification-panel"><div className="panel-head"><div><h3>Notification history</h3><p className="muted">Warning and critical event notifications</p></div><span className="panel-count">{state.notifications.length}</span></div>{state.notifications.length===0?<div className="empty-state"><span className="empty-icon"><Bell size={19}/></span><strong>No notifications yet</strong><span>Incident alerts will appear here.</span></div>:<div className="notification-list">{state.notifications.slice(0,8).map(n=><div className="notification-row" key={n.id}><span className={`notif-icon ${n.mode==='real'?'real':'mock'}`}>{n.mode==='real'?<Radio size={15}/>:<Bell size={15}/>}</span><div className="notif-main"><div className="notif-title"><strong>{n.zone_name} · {n.gas_name} · {n.event_severity}</strong><span className={`notif-status ${n.status==='FAILED'?'failed':''}`}>{n.status.replaceAll('_',' ')}</span></div><p>{n.reading} {n.unit} <span>·</span> {dateTime(n.created_at)}</p><small className="notif-message">{n.message}</small><small>{n.mode==='mock'?'Mock only · no SMS sent':n.provider_message_id?`Provider accepted · ID ${n.provider_message_id}`:'Provider response recorded'}</small></div></div>)}</div>}</div></section>
-      <section className="panel incidents-panel"><div className="panel-head"><div><h3>Incident history</h3><p className="muted">Review events and record operator actions.</p></div><span className="panel-count">{state.incidents.length} records</span></div>{state.incidents.length===0?<div className="incident-empty"><ShieldCheck size={18}/><span>No incidents recorded. Zone events will be listed here.</span></div>:<div className="table-scroll"><table><thead><tr><th>ZONE / GAS</th><th>SEVERITY</th><th>READING</th><th>THRESHOLD</th><th>CREATED</th><th>STATE</th><th>NOTIFICATION</th><th>ACTIONS</th></tr></thead><tbody>{state.incidents.map(i=><tr key={i.incident_id}><td><strong>{i.zone_name}</strong><span className="table-sub">{i.gas_name} ({i.formula})</span></td><td><span className={`severity-tag ${i.severity.toLowerCase()}`}><span/>{i.severity}</span></td><td><strong>{i.reading}</strong> <span className="muted">{i.unit}</span></td><td>{i.display_threshold} <span className="muted">{i.unit}</span></td><td>{dateTime(i.created_at)}</td><td><span className={`state-tag ${i.state.toLowerCase()}`}>{i.state}</span>{i.acknowledged_at&&<span className="table-sub">Acknowledged {dateTime(i.acknowledged_at)}</span>}{i.resolved_at&&<span className="table-sub">Resolved {dateTime(i.resolved_at)}</span>}</td><td>{i.notification_status?<span className={`notif-status ${i.notification_status==='FAILED'?'failed':''}`}>{i.notification_mode==='mock'?'MOCK · ':''}{i.notification_status.replaceAll('_',' ')}</span>:<span className="muted">—</span>}</td><td><div className="row-actions"><button className="text-button" disabled={!canOperate||i.state!=='OPEN'||!!busy} onClick={()=>requestAction(`ack-${i.incident_id}`,`/api/incidents/${i.incident_id}/acknowledge`,{actor:'Operator'})}><Check size={13}/> Acknowledge</button><button className="text-button resolve" disabled={!canOperate||i.state==='RESOLVED'||!!busy} onClick={()=>requestAction(`res-${i.incident_id}`,`/api/incidents/${i.incident_id}/resolve`,{actor:'Operator'})}><ShieldCheck size={13}/> Resolve</button></div></td></tr>)}</tbody></table></div>}</section>
+      <section className="panel incidents-panel"><div className="panel-head"><div><h3>Incident history</h3><p className="muted">Review events and record operator actions.</p></div><span className="panel-count">{state.incidents.length} records</span></div>{state.incidents.length===0?<div className="incident-empty"><ShieldCheck size={18}/><span>No incidents recorded. Zone events will be listed here.</span></div>:<div className="table-scroll"><table><thead><tr><th>ZONE / GAS</th><th>SEVERITY</th><th>READING</th><th>THRESHOLD</th><th>CREATED</th><th>STATE</th><th>NOTIFICATION</th><th>ACTIONS</th></tr></thead><tbody>{state.incidents.map(i=><tr key={i.incident_id}><td><strong>{i.zone_name}</strong><span className="table-sub">{i.gas_name} ({i.formula})</span></td><td><span className={`severity-tag ${i.severity.toLowerCase()}`}><span/>{i.severity}</span></td><td><strong>{i.reading}</strong> <span className="muted">{i.unit}</span></td><td>{i.display_threshold} <span className="muted">{i.unit}</span></td><td>{dateTime(i.created_at)}</td><td><span className={`state-tag ${i.state.toLowerCase()}`}>{i.state}</span>{i.acknowledged_at&&<span className="table-sub">Acknowledged {dateTime(i.acknowledged_at)}</span>}{i.resolved_at&&<span className="table-sub">Resolved {dateTime(i.resolved_at)}</span>}</td><td>{i.notification_status?<span className={`notif-status ${i.notification_status==='FAILED'?'failed':''}`}>{i.notification_mode==='mock'?'MOCK · ':''}{i.notification_status.replaceAll('_',' ')}</span>:<span className="muted">—</span>}</td><td><div className="row-actions"><button className="text-button" disabled={!canOperate||i.state!=='OPEN'||!!busy} onClick={()=>requestAction(`ack-${i.incident_id}`,`/api/incidents/${i.incident_id}/acknowledge`,{actor:'Operator'})}><Check size={13}/>{busy===`ack-${i.incident_id}`?'Saving…':' Acknowledge'}</button><button className="text-button resolve" disabled={!canOperate||i.state==='RESOLVED'||!!busy} onClick={()=>requestAction(`res-${i.incident_id}`,`/api/incidents/${i.incident_id}/resolve`,{actor:'Operator'})}><ShieldCheck size={13}/>{busy===`res-${i.incident_id}`?'Saving…':' Resolve'}</button></div></td></tr>)}</tbody></table></div>}</section>
     </main>
   </div>
 }

@@ -104,10 +104,11 @@ async def broadcast():
         return
 
 
-async def save_reading(conn, zone, value: float, critical_latched: bool = False):
-    now = datetime.now(timezone.utc)
+async def save_reading(conn, zone, value: float, critical_latched: bool = False, *, measured_at=None, reading_persisted=False):
+    now = measured_at or datetime.now(timezone.utc)
     status = classify(value, zone["warning_threshold"], zone["critical_threshold"])
-    await conn.execute("INSERT INTO readings(zone_id,value,unit,measured_at) VALUES($1,$2,$3,$4)", zone["id"], value, zone["unit"], now)
+    if not reading_persisted:
+        await conn.execute("INSERT INTO readings(zone_id,value,unit,measured_at) VALUES($1,$2,$3,$4)", zone["id"], value, zone["unit"], now)
     # An unresolved critical incident already represents this continuous event.
     # Keep recording readings without querying/updating the same incident each tick.
     if status == "NORMAL" or (status == "CRITICAL" and critical_latched):
@@ -155,9 +156,18 @@ async def simulator_loop():
                         FROM zones z
                         LEFT JOIN LATERAL (SELECT value FROM readings WHERE zone_id=z.id ORDER BY measured_at DESC,id DESC LIMIT 1) latest ON true
                         ORDER BY z.id""")
+                    measured_at = datetime.now(timezone.utc)
+                    cycle_readings = []
                     for zone in zones:
                         critical_latched = bool(zone["critical_latched"])
-                        await save_reading(conn, zone, simulation_reading(zone, zone["prior_reading"], critical_latched), critical_latched)
+                        value = simulation_reading(zone, zone["prior_reading"], critical_latched)
+                        cycle_readings.append((zone, value, critical_latched))
+                    await conn.executemany(
+                        "INSERT INTO readings(zone_id,value,unit,measured_at) VALUES($1,$2,$3,$4)",
+                        [(zone["id"], value, zone["unit"], measured_at) for zone, value, _ in cycle_readings],
+                    )
+                    for zone, value, critical_latched in cycle_readings:
+                        await save_reading(conn, zone, value, critical_latched, measured_at=measured_at, reading_persisted=True)
             await broadcast()
         except asyncio.CancelledError:
             raise
@@ -438,6 +448,7 @@ async def reset_demo_data(request: Request):
 async def critical_simulation(body: SimulationCriticalRequest, request: Request):
     global simulator_task, simulator_enabled
     actor = current_operator(request)
+    measured_at = datetime.now(timezone.utc)
     async with simulator_control_lock:
         now = asyncio.get_running_loop().time()
         check_critical_simulation_cooldown(body.zone_id, now)
@@ -447,16 +458,16 @@ async def critical_simulation(body: SimulationCriticalRequest, request: Request)
                 if not zone:
                     raise HTTPException(404, "Zone not found")
                 value = round(float(zone["critical_threshold"]) * 1.08, 3)
-                await save_reading(conn, zone, value)
+                await save_reading(conn, zone, value, measured_at=measured_at)
                 await conn.execute("INSERT INTO audit_events(actor,action,entity_type,entity_id) VALUES($1,'CRITICAL_SIMULATION','zone',$2)", actor, str(zone["id"]))
         critical_simulation_last_trigger[body.zone_id] = now
         if not simulator_enabled:
             simulator_enabled = True
             simulator_task = asyncio.create_task(simulator_loop())
-    # The client refreshes persisted state after this committed response. The
-    # simulator's first normal tick broadcasts the next update, avoiding a
-    # duplicate immediate WebSocket frame.
-    return {"zone_id": body.zone_id, "reading": value, "status": "CRITICAL"}
+    # Push the committed state to other connected dashboards immediately. The
+    # initiating dashboard also applies the confirmed reading from this response.
+    asyncio.create_task(broadcast())
+    return {"zone_id": body.zone_id, "reading": value, "status": "CRITICAL", "measured_at": measured_at.isoformat()}
 
 
 async def change_incident(incident_id: str, actor: str, action: str):
