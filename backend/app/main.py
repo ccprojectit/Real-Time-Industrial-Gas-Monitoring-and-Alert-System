@@ -151,22 +151,28 @@ async def simulator_loop():
     while simulator_enabled and loop.time() < deadline:
         cycle_started = loop.time()
         try:
-            async with require_pool().acquire() as conn:
-                async with conn.transaction():
-                    zones = await conn.fetch("""SELECT z.id,z.unit,z.critical_threshold,z.normal_min,z.normal_max,
-                        latest.value AS prior_reading
-                        FROM zones z
-                        LEFT JOIN LATERAL (SELECT value FROM readings WHERE zone_id=z.id ORDER BY measured_at DESC,id DESC LIMIT 1) latest ON true
-                        ORDER BY z.id FOR UPDATE OF z""")
-                    measured_at = datetime.now(timezone.utc)
-                    cycle_readings = []
-                    for zone in zones:
-                        value = simulation_reading(zone, zone["prior_reading"])
-                        cycle_readings.append((zone, value))
-                    await conn.executemany(
-                        "INSERT INTO readings(zone_id,value,unit,measured_at) VALUES($1,$2,$3,$4)",
-                        [(zone["id"], value, zone["unit"], measured_at) for zone, value in cycle_readings],
-                    )
+            # Serialize each tick with manual critical requests, stop, and reset.
+            # Otherwise a tick computed from an old Normal value could commit
+            # after a Critical trigger and replace that zone's latest reading.
+            async with simulator_control_lock:
+                if not simulator_enabled:
+                    break
+                async with require_pool().acquire() as conn:
+                    async with conn.transaction():
+                        zones = await conn.fetch("""SELECT z.id,z.unit,z.critical_threshold,z.normal_min,z.normal_max,
+                            latest.value AS prior_reading
+                            FROM zones z
+                            LEFT JOIN LATERAL (SELECT value FROM readings WHERE zone_id=z.id ORDER BY measured_at DESC,id DESC LIMIT 1) latest ON true
+                            ORDER BY z.id FOR UPDATE OF z""")
+                        measured_at = datetime.now(timezone.utc)
+                        cycle_readings = []
+                        for zone in zones:
+                            value = simulation_reading(zone, zone["prior_reading"])
+                            cycle_readings.append((zone, value))
+                        await conn.executemany(
+                            "INSERT INTO readings(zone_id,value,unit,measured_at) VALUES($1,$2,$3,$4)",
+                            [(zone["id"], value, zone["unit"], measured_at) for zone, value in cycle_readings],
+                        )
             await broadcast()
         except asyncio.CancelledError:
             raise
