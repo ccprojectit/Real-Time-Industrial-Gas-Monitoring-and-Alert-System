@@ -263,59 +263,26 @@ class NotificationConnection:
         self.saved = args
 
 
-def test_mock_notification_never_sends_sms(monkeypatch):
-    monkeypatch.setattr(notifications.settings, "sms_enabled", False)
-    monkeypatch.setattr(notifications.settings, "sms_mode", "mock")
+@pytest.mark.parametrize("severity", ["WARNING", "CRITICAL"])
+def test_warning_and_critical_incidents_create_mock_records_without_network(monkeypatch, severity):
+    def forbidden_network_client(*_args, **_kwargs):
+        raise AssertionError("Mock notification must never create an external HTTP client")
+
+    # If a future change reintroduces an HTTP client call in this module, fail this test.
+    monkeypatch.setattr(notifications, "httpx", type("Httpx", (), {"AsyncClient": forbidden_network_client}), raising=False)
     conn = NotificationConnection()
-    incident = {"id": "abc", "zone_name": "Zone 1", "gas_name": "Carbon Monoxide", "reading": 101,
-                "unit": "ppm", "created_at": datetime.now(timezone.utc)}
-    asyncio.run(notifications.notify_incident(conn, incident, "WARNING"))
-    assert conn.saved[0] == "abc"
-    assert conn.saved[1] == "WARNING"
-    assert conn.saved[2] == "mock"
-    assert conn.saved[3] == "MOCK_RECORDED"
-    assert "No SMS sent" in json.loads(conn.saved[6])["detail"]
-
-
-def test_provider_failure_is_saved_as_failed_without_retry(monkeypatch):
-    class Response:
-        is_success = False
-        status_code = 429
-        text = "rate limited"
-
-    class Client:
-        def __init__(self, **_): pass
-        async def __aenter__(self): return self
-        async def __aexit__(self, *_): pass
-        async def post(self, *_args, **_kwargs): return Response()
-
-    monkeypatch.setattr(notifications.settings, "sms_enabled", True)
-    monkeypatch.setattr(notifications.settings, "sms_mode", "real")
-    for key, value in {
-        "exotel_account_sid": "sid", "exotel_api_key": "key", "exotel_api_token": "token",
-        "exotel_sender_id": "test-sender", "sms_recipient_number": "test-recipient",
-    }.items(): monkeypatch.setattr(notifications.settings, key, value)
-    monkeypatch.setattr(notifications.httpx, "AsyncClient", Client)
-    conn = NotificationConnection()
-    incident = {"id": "abc", "zone_name": "Zone 1", "gas_name": "Carbon Monoxide", "reading": 101,
-                "unit": "ppm", "created_at": datetime.now(timezone.utc)}
-    asyncio.run(notifications.notify_incident(conn, incident, "CRITICAL"))
-    assert conn.saved[2] == "real"
-    assert conn.saved[3] == "FAILED"
-    assert json.loads(conn.saved[6])["http_status"] == 429
-
-
-def test_warning_incident_notification_is_recorded_immediately(monkeypatch):
-    monkeypatch.setattr(notifications.settings, "sms_enabled", False)
-    monkeypatch.setattr(notifications.settings, "sms_mode", "mock")
-    conn = NotificationConnection()
-    incident = {"id": "warning-1", "zone_name": "Zone 2", "gas_name": "Methane", "reading": 11,
+    incident = {"id": f"{severity.lower()}-1", "zone_name": "Zone 2", "gas_name": "Methane", "reading": 11,
                 "unit": "% LEL", "created_at": datetime.now(timezone.utc)}
-    asyncio.run(notifications.notify_incident(conn, incident, "WARNING"))
-    assert conn.saved[1] == "WARNING"
+
+    asyncio.run(notifications.notify_incident(conn, incident, severity))
+
+    assert conn.saved[0] == incident["id"]
+    assert conn.saved[1] == severity
     assert conn.saved[2] == "mock"
     assert conn.saved[3] == "MOCK_RECORDED"
-    assert "WARNING gas alert" in conn.saved[4]
+    assert f"{severity} gas alert" in conn.saved[4]
+    assert conn.saved[5] is None
+    assert "Mock only; no SMS sent" in json.loads(conn.saved[6])["detail"]
 
 
 def test_critical_simulation_readings_remain_at_or_above_critical_threshold(monkeypatch):

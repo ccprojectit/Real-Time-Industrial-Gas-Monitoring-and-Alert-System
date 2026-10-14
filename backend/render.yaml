@@ -27,9 +27,5 @@ services:
         value: "0.35"
       - key: CRITICAL_SIMULATION_COOLDOWN_SECONDS
         value: "5"
-      - key: SMS_MODE
-        value: mock
-      - key: SMS_ENABLED
-        value: "false"
       - key: CORS_ORIGINS
         sync: false

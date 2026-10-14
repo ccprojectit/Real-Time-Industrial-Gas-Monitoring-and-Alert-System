@@ -44,10 +44,6 @@ def validate_production_configuration() -> None:
     environment = settings.app_env.strip().lower()
     if environment not in {"development", "test", "production"}:
         problems.append("APP_ENV must be development, test, or production")
-    if settings.sms_enabled and settings.sms_mode.lower() == "real" and not settings.real_sms_ready:
-        problems.append("Real SMS is enabled but provider credentials, sender, or recipient configuration is incomplete")
-    if settings.real_sms_ready and not settings.auth_required:
-        problems.append("AUTH_REQUIRED must be true before real SMS can be enabled")
     if environment in {"development", "test"}:
         if problems:
             raise RuntimeError("Unsafe notification configuration: " + "; ".join(problems))
@@ -231,7 +227,7 @@ async def health():
     except Exception:
         pass
     return {"status": "ok" if db == "connected" else "degraded", "database": db,
-            "simulator_running": simulator_enabled, "sms_mode": "real" if settings.real_sms_ready else "mock"}
+            "simulator_running": simulator_enabled, "sms_mode": "mock"}
 
 
 @app.post("/api/auth/login")
