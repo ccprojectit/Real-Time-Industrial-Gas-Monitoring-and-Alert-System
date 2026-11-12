@@ -86,8 +86,10 @@ export default function App() {
     let socket:WebSocket|undefined, retry:number
     const connect=()=>{const url=new URL('/api/ws',API);url.protocol=url.protocol==='https:'?'wss:':'ws:';socket=new WebSocket(url);socket.onopen=()=>{wsConnected.current=true;void refresh()};socket.onmessage=event=>{try{const message=JSON.parse(event.data) as {type:string;zones?:Zone[];simulator_running?:boolean};if(message.type!=='state'||!message.zones)return
       const prior=zonesRef.current
-      const changed=message.zones.some(z=>{const old=prior.find(p=>p.id===z.id);return old&&(old.status!==z.status||old.active_incident_id!==z.active_incident_id)})
-      setState(s=>{let readings=s.readings;for(const zone of message.zones!){if(zone.current_reading==null||!zone.last_updated)continue;const exists=readings.some(r=>r.zone_id===zone.id&&r.measured_at===zone.last_updated);if(!exists)readings=[...readings,{id:Date.parse(zone.last_updated),zone_id:zone.id,zone_name:zone.name,gas_name:zone.gas_name,value:Number(zone.current_reading),unit:zone.unit,measured_at:zone.last_updated}]}return {...s,zones:message.zones!,readings:readings.slice(-1000),simulator:message.simulator_running??s.simulator,health:'connected'}})
+      const accepted=message.zones.map(zone=>{const old=prior.find(item=>item.id===zone.id);return old?.last_updated&&zone.last_updated&&Date.parse(zone.last_updated)<Date.parse(old.last_updated)?old:zone})
+      const changed=accepted.some(z=>{const old=prior.find(p=>p.id===z.id);return old&&(old.status!==z.status||old.active_incident_id!==z.active_incident_id)})
+      zonesRef.current=accepted
+      setState(s=>{let readings=s.readings;for(const zone of accepted){if(zone.current_reading==null||!zone.last_updated)continue;const exists=readings.some(r=>r.zone_id===zone.id&&r.measured_at===zone.last_updated);if(!exists)readings=[...readings,{id:Date.parse(zone.last_updated),zone_id:zone.id,zone_name:zone.name,gas_name:zone.gas_name,value:Number(zone.current_reading),unit:zone.unit,measured_at:zone.last_updated}]}return {...s,zones:accepted,readings:readings.slice(-1000),simulator:message.simulator_running??s.simulator,health:'connected'}})
       setError('');if(changed)void refreshHistory()
     }catch{/* Ignore malformed frames and keep the fallback poll available. */}};socket.onclose=()=>{wsConnected.current=false;retry=window.setTimeout(connect,3000)};socket.onerror=()=>socket?.close()}
     connect();return()=>{wsConnected.current=false;clearTimeout(retry);socket?.close()}
@@ -118,7 +120,8 @@ export default function App() {
         setState(s=>({...s,simulator:!!result.simulator_running}))
         setSuccess(result.simulator_running?'Simulation started.':'Simulation stopped.')
       } else if(path==='/api/simulation/critical'||path==='/api/simulation/critical/batch'){
-        const events=path.endsWith('/batch')?(result.zones as Array<{zone_id:number;reading:number;status:'NORMAL'|'CRITICAL';measured_at:string}>):[result as {zone_id:number;reading:number;status:'NORMAL'|'CRITICAL';measured_at:string}]
+        type CriticalEvent={zone_id:number;reading:number;status:'NORMAL'|'CRITICAL';measured_at:string;incident?:Incident;notification?:Notification}
+        const events=path.endsWith('/batch')?(result.zones as CriticalEvent[]):[result as CriticalEvent]
         if(events.length){
           setChartZone(Number(events[0].zone_id))
           const updates=new Map<number,Zone>()
@@ -130,9 +133,11 @@ export default function App() {
             updates.set(zone.id,{...zone,current_reading:Number(event.reading),previous_reading:zone.current_reading,last_updated:event.measured_at,status:event.status})
           }
           zonesRef.current=zonesRef.current.map(zone=>updates.get(zone.id)||zone)
-          setState(s=>({...s,zones:s.zones.map(zone=>updates.get(zone.id)||zone),readings:[...s.readings.filter(item=>!readings.some(reading=>reading.zone_id===item.zone_id&&reading.measured_at===item.measured_at)),...readings].slice(-1000),simulator:path.endsWith('/batch')?!!result.simulator_running:true}))
+          const incidents=events.flatMap(event=>event.incident?[event.incident]:[])
+          const notifications=events.flatMap(event=>event.notification?[event.notification]:[])
+          historySequence.current++
+          setState(s=>({...s,zones:s.zones.map(zone=>updates.get(zone.id)||zone),readings:[...s.readings.filter(item=>!readings.some(reading=>reading.zone_id===item.zone_id&&reading.measured_at===item.measured_at)),...readings].slice(-1000),incidents:[...incidents,...s.incidents.filter(item=>!incidents.some(updated=>updated.incident_id===item.incident_id))],notifications:[...notifications,...s.notifications.filter(item=>!notifications.some(updated=>updated.id===item.id))],simulator:path.endsWith('/batch')?!!result.simulator_running:true}))
         }
-        void refreshHistory()
         setSuccess(`Critical event recorded for ${events.length} ${events.length===1?'zone':'zones'}.`)
       }
     } catch(e) {

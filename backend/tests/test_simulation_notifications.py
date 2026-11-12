@@ -14,6 +14,13 @@ from app.security import current_operator
 from fastapi.testclient import TestClient
 
 
+def mock_notification_record(incident):
+    return {"id":f"notification-{incident['id']}","incident_id":str(incident["id"]),
+            "event_severity":"CRITICAL","mode":"mock","status":"MOCK_RECORDED",
+            "message":"CRITICAL gas alert recorded","provider_message_id":None,
+            "created_at":incident["created_at"]}
+
+
 @pytest.fixture(autouse=True)
 def disable_external_database_for_api_tests(monkeypatch):
     async def no_database_connect():
@@ -50,6 +57,8 @@ class MemoryConnection:
         self.executed.append((sql, args))
         if "UPDATE incidents SET state='RESOLVED'" in sql:
             return None
+        if "FROM notifications" in sql:
+            return None
         if "SELECT * FROM incidents" in sql:
             return self.active if self.active and self.active.get("severity") == "CRITICAL" and self.active.get("state") != "RESOLVED" else None
         if "INSERT INTO incidents" in sql:
@@ -58,6 +67,8 @@ class MemoryConnection:
                 "reading": args[3], "unit": args[4], "warning_threshold_at_creation": args[5],
                 "critical_threshold_at_creation": args[6], "threshold": args[6],
                 "created_at": args[7], "critical_at": args[7], "gas_name": args[1],
+                "formula":args[2],"zone_id":args[0],"state":"OPEN","acknowledged_at":None,
+                "acknowledged_by":None,"resolved_at":None,"resolved_by":None,
             }
             self.created.append(self.active)
             return self.active
@@ -100,25 +111,31 @@ class CriticalBatchConnection:
     async def fetchrow(self, sql, *args):
         if "UPDATE incidents SET state='RESOLVED'" in sql:
             return None
+        if "FROM notifications" in sql:
+            return next((n for n in self.notifications if n["incident_id"]==args[0] and n["event_severity"]=="CRITICAL"),None)
         if "SELECT * FROM incidents" in sql:
             return next((i for i in self.incidents if i["zone_id"]==args[0] and i["severity"]=="CRITICAL" and i["state"]!="RESOLVED"),None)
         if "INSERT INTO incidents" in sql:
             incident={"id":f"incident-{len(self.incidents)+1}","zone_id":args[0],"gas_name":args[1],"formula":args[2],
                 "severity":"CRITICAL","reading":args[3],"unit":args[4],"warning_threshold_at_creation":args[5],
-                "critical_threshold_at_creation":args[6],"threshold":args[6],"created_at":args[7],"critical_at":args[7],"state":"OPEN"}
+                "critical_threshold_at_creation":args[6],"threshold":args[6],"created_at":args[7],"critical_at":args[7],"state":"OPEN",
+                "acknowledged_at":None,"acknowledged_by":None,"resolved_at":None,"resolved_by":None}
             self.incidents.append(incident)
             return incident
+        if "INSERT INTO notifications" in sql:
+            self.notification_attempts+=1
+            if self.fail_notification_number==self.notification_attempts:
+                raise RuntimeError("simulated notification persistence failure")
+            notification={"id":f"notification-{len(self.notifications)+1}","incident_id":args[0],
+                "event_severity":args[1],"mode":args[2],"status":args[3],"message":args[4],
+                "provider_message_id":args[5],"created_at":datetime.now(timezone.utc)}
+            self.notifications.append(notification)
+            return notification
         raise AssertionError(sql)
 
     async def execute(self, sql, *args):
         if "INSERT INTO readings" in sql:
             self.readings.append({"zone_id":args[0],"value":args[1],"unit":args[2],"measured_at":args[3]})
-        elif "INSERT INTO notifications" in sql:
-            self.notification_attempts+=1
-            if self.fail_notification_number==self.notification_attempts:
-                raise RuntimeError("simulated notification persistence failure")
-            self.notifications.append({"id":f"notification-{len(self.notifications)+1}","incident_id":args[0],
-                "event_severity":args[1],"mode":args[2],"status":args[3],"message":args[4]})
         elif "INSERT INTO audit_events" in sql:
             self.audit.append((sql,args))
         else:
@@ -137,6 +154,7 @@ def test_critical_simulation_creates_one_incident_per_selected_zone(monkeypatch)
 
     async def no_sms(conn, incident):
         calls.append((incident, "CRITICAL"))
+        return mock_notification_record(incident)
 
     monkeypatch.setattr(main, "notify_incident", no_sms)
     for zone_id, gas, formula, unit, warning, critical in [
@@ -191,7 +209,9 @@ def test_critical_api_persists_immediately_and_rejects_rapid_duplicate(monkeypat
     pool = Pool()
     notified = []
     created_tasks = []
-    async def no_sms(_conn, incident): notified.append((incident, "CRITICAL"))
+    async def no_sms(_conn, incident):
+        notified.append((incident, "CRITICAL"))
+        return mock_notification_record(incident)
     def hold_task(coro):
         coro.close()
         task = object()
@@ -374,6 +394,7 @@ def test_incident_deduplication_while_zone_condition_stays_active(monkeypatch):
 
     async def no_sms(conn, incident):
         calls.append((incident, "CRITICAL"))
+        return mock_notification_record(incident)
 
     monkeypatch.setattr(main, "notify_incident", no_sms)
 
@@ -393,11 +414,13 @@ class NotificationConnection:
     def __init__(self):
         self.saved = None
 
-    async def fetchval(self, *_):
-        return None
-
-    async def execute(self, sql, *args):
+    async def fetchrow(self, sql, *args):
         self.saved = args
+        if "INSERT INTO notifications" in sql:
+            return {"id":"notification-1","incident_id":args[0],"event_severity":args[1],
+                    "mode":args[2],"status":args[3],"message":args[4],
+                    "provider_message_id":args[5],"created_at":datetime.now(timezone.utc)}
+        return None
 
 
 def test_critical_incidents_create_mock_records_without_network(monkeypatch):
@@ -541,9 +564,9 @@ def test_simulator_stops_after_configured_maximum_runtime(monkeypatch):
 
 def test_simulator_batches_zone_readings_in_one_database_write(monkeypatch):
     zones = [
-        {"id": zone_id, "name": f"Zone {zone_id}", "gas_name": "Gas", "unit": "ppm",
+        {"id": zone_id, "name": f"Zone {zone_id}", "gas_name": "Gas", "formula":"G", "unit": "ppm",
          "critical_threshold": 100, "normal_min": 0, "normal_max": 20,
-         "prior_reading": 5}
+         "prior_reading": 5, "previous_reading":4, "active_incident_id":None}
         for zone_id in range(1, 5)
     ]
 
@@ -569,7 +592,7 @@ def test_simulator_batches_zone_readings_in_one_database_write(monkeypatch):
     monkeypatch.setattr(main, "require_pool", lambda: pool)
     monkeypatch.setattr(main, "simulator_enabled", True)
     monkeypatch.setattr(main, "simulator_task", None)
-    monkeypatch.setattr(main, "broadcast", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(main, "broadcast", lambda *_args, **_kwargs: asyncio.sleep(0))
     monkeypatch.setattr(main.random, "random", lambda: 1.0)
 
     async def end_after_one_cycle(_delay):
@@ -685,19 +708,21 @@ def test_acknowledge_records_actor_and_resolve_returns_critical_zone_to_normal(m
         def transaction(self): return Tx()
         async def fetchrow(self, sql, *args):
             self.statements.append(sql)
-            if sql.startswith("UPDATE incidents SET"):
+            if "UPDATE incidents SET" in sql:
                 column, state = ("acknowledged", "ACKNOWLEDGED") if "acknowledged_at" in sql else ("resolved", "RESOLVED")
                 self.incident.update({"state":state, f"{column}_at":"recorded", f"{column}_by":args[1]})
-                return dict(self.incident)
-            if sql.startswith("SELECT id,unit,critical_threshold"):
-                return {"id":1,"unit":"ppm","critical_threshold":100,"normal_min":0,"normal_max":12}
+                self.audit.append((args[1],args[3]))
+                result=dict(self.incident)
+                if args[3]=="RESOLVE":
+                    reading={"zone_id":1,"reading":5.0,"unit":"ppm","measured_at":datetime.now(timezone.utc)}
+                    self.readings.append(reading)
+                    result.update({"recovery_reading":reading["reading"],"recovery_unit":reading["unit"],
+                                   "recovery_measured_at":reading["measured_at"]})
+                else:
+                    result.update({"recovery_reading":None,"recovery_unit":None,"recovery_measured_at":None})
+                return result
             raise AssertionError(sql)
         async def fetchval(self, *_): return None
-        async def execute(self, sql, *args):
-            if sql.startswith("INSERT INTO readings"):
-                self.readings.append(args)
-            else:
-                self.audit.append(args)
 
     class Pool:
         def __init__(self): self.conn = Conn()

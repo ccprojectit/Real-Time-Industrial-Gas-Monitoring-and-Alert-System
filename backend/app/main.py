@@ -88,10 +88,12 @@ async def snapshot(conn):
     return api_json([dict(r) for r in rows])
 
 
-async def broadcast():
+async def broadcast(zones=None):
     try:
-        async with require_pool().acquire() as conn:
-            payload = json.dumps({"type": "state", "simulator_running": simulator_enabled, "zones": await snapshot(conn)})
+        if zones is None:
+            async with require_pool().acquire() as conn:
+                zones = await snapshot(conn)
+        payload = json.dumps({"type": "state", "simulator_running": simulator_enabled, "zones": zones})
         stale = []
         for ws in clients:
             try:
@@ -105,22 +107,35 @@ async def broadcast():
 
 async def save_critical_reading(conn, zone, value: float, *, measured_at=None):
     now = measured_at or datetime.now(timezone.utc)
-    await conn.execute("INSERT INTO readings(zone_id,value,unit,measured_at) VALUES($1,$2,$3,$4)", zone["id"], value, zone["unit"], now)
-    # Old unresolved Warning incidents are retired (not deleted) so their legacy
-    # partial unique index cannot block a new Critical incident for this zone.
-    legacy = await conn.fetchrow("""UPDATE incidents SET state='RESOLVED',resolved_at=$1,
-        resolved_by='System (retired legacy alert)' WHERE zone_id=$2 AND severity='WARNING'
-        AND state <> 'RESOLVED' RETURNING id::text AS id""", now, zone["id"])
-    if legacy:
-        await conn.execute("INSERT INTO audit_events(actor,action,entity_type,entity_id) VALUES('system','RETIRE_LEGACY_ALERT','incident',$1)", legacy["id"])
+    # Persist the reading and retire any unresolved legacy incident atomically
+    # in one database round trip. Legacy rows remain in history.
+    await conn.execute("""WITH inserted_reading AS (
+        INSERT INTO readings(zone_id,value,unit,measured_at) VALUES($1,$2,$3,$4)
+        RETURNING zone_id
+        ), retired AS (
+        UPDATE incidents SET state='RESOLVED',resolved_at=$4,
+            resolved_by='System (retired legacy alert)'
+        WHERE zone_id=$1 AND severity='WARNING' AND state <> 'RESOLVED'
+          AND EXISTS (SELECT 1 FROM inserted_reading WHERE zone_id=$1)
+        RETURNING id::text AS id
+        )
+        INSERT INTO audit_events(actor,action,entity_type,entity_id)
+        SELECT 'system','RETIRE_LEGACY_ALERT','incident',id FROM retired""", zone["id"], value, zone["unit"], now)
     incident = await conn.fetchrow("""SELECT * FROM incidents WHERE zone_id=$1 AND severity='CRITICAL'
         AND state <> 'RESOLVED' ORDER BY created_at DESC LIMIT 1 FOR UPDATE""", zone["id"])
+    is_new_incident = incident is None
     if incident is None:
         incident = await conn.fetchrow("""INSERT INTO incidents(zone_id,gas_name,formula,severity,reading,unit,
             warning_threshold_at_creation,critical_threshold_at_creation,threshold,created_at,critical_at,state)
             VALUES($1,$2,$3,'CRITICAL',$4,$5,$6,$7,$7,$8,$8,'OPEN') RETURNING *""", zone["id"], zone["gas_name"], zone["formula"],
             value, zone["unit"], zone["warning_threshold"], zone["critical_threshold"], now)
-        await notify_incident(conn, {**dict(incident), "zone_name": zone["name"]})
+    if is_new_incident:
+        notification = await notify_incident(conn, {**dict(incident), "zone_name": zone["name"]})
+    else:
+        notification = await conn.fetchrow(
+            "SELECT id::text AS id,incident_id::text AS incident_id,event_severity,mode,status,message,provider_message_id,created_at "
+            "FROM notifications WHERE incident_id=$1 AND event_severity='CRITICAL'", incident["id"])
+    return {"incident": dict(incident), "notification": dict(notification) if notification else None}
 
 
 def simulation_reading(zone, prior: float | None) -> float:
@@ -159,10 +174,13 @@ async def simulator_loop():
                     break
                 async with require_pool().acquire() as conn:
                     async with conn.transaction():
-                        zones = await conn.fetch("""SELECT z.id,z.unit,z.critical_threshold,z.normal_min,z.normal_max,
-                            latest.value AS prior_reading
+                        zones = await conn.fetch("""SELECT z.id,z.name,z.gas_name,z.formula,z.unit,z.critical_threshold,z.normal_min,z.normal_max,
+                            latest.value AS prior_reading,prev.value AS previous_reading,
+                            active.id::text AS active_incident_id
                             FROM zones z
-                            LEFT JOIN LATERAL (SELECT value FROM readings WHERE zone_id=z.id ORDER BY measured_at DESC,id DESC LIMIT 1) latest ON true
+                            LEFT JOIN LATERAL (SELECT value,measured_at FROM readings WHERE zone_id=z.id ORDER BY measured_at DESC,id DESC LIMIT 1) latest ON true
+                            LEFT JOIN LATERAL (SELECT value FROM readings WHERE zone_id=z.id ORDER BY measured_at DESC,id DESC OFFSET 1 LIMIT 1) prev ON true
+                            LEFT JOIN LATERAL (SELECT id FROM incidents WHERE zone_id=z.id AND severity='CRITICAL' AND state <> 'RESOLVED' ORDER BY created_at DESC LIMIT 1) active ON true
                             ORDER BY z.id FOR UPDATE OF z""")
                         measured_at = datetime.now(timezone.utc)
                         cycle_readings = []
@@ -173,7 +191,15 @@ async def simulator_loop():
                             "INSERT INTO readings(zone_id,value,unit,measured_at) VALUES($1,$2,$3,$4)",
                             [(zone["id"], value, zone["unit"], measured_at) for zone, value in cycle_readings],
                         )
-            await broadcast()
+                        live_zones = [{
+                            "id": zone["id"], "name": zone["name"], "gas_name": zone["gas_name"],
+                            "formula": zone["formula"], "unit": zone["unit"],
+                            "critical_threshold": zone["critical_threshold"], "current_reading": value,
+                            "previous_reading": zone["prior_reading"], "last_updated": measured_at,
+                            "status": "CRITICAL" if value >= float(zone["critical_threshold"]) else "NORMAL",
+                            "active_incident_id": zone["active_incident_id"],
+                        } for zone, value in cycle_readings]
+            await broadcast(api_json(live_zones))
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -470,13 +496,37 @@ async def critical_simulation_for_zones(zone_ids: list[int], actor: str) -> list
                     zone = zones_by_id[zone_id]
                     threshold = float(zone["critical_threshold"])
                     value = round(max(threshold * 1.08, threshold + 0.001), 3)
-                    await save_critical_reading(conn, zone, value, measured_at=measured_at)
+                    record = await save_critical_reading(conn, zone, value, measured_at=measured_at)
                     await conn.execute(
                         "INSERT INTO audit_events(actor,action,entity_type,entity_id) VALUES($1,'CRITICAL_SIMULATION','zone',$2)",
                         actor, str(zone["id"]),
                     )
+                    incident = record["incident"]
+                    notification = record["notification"]
                     created.append({"zone_id": zone_id, "reading": value, "status": "CRITICAL",
-                                    "measured_at": measured_at.isoformat()})
+                                    "measured_at": measured_at.isoformat(),
+                                    "incident": {
+                                        "incident_id": str(incident["id"]), "zone_id": zone_id,
+                                        "zone_name": zone["name"], "gas_name": incident["gas_name"],
+                                        "formula": incident["formula"], "severity": "CRITICAL",
+                                        "reading": incident["reading"], "unit": incident["unit"],
+                                        "display_threshold": incident["threshold"],
+                                        "critical_at": incident["critical_at"], "created_at": incident["created_at"],
+                                        "state": incident["state"], "acknowledged_at": incident.get("acknowledged_at"),
+                                        "acknowledged_by": incident.get("acknowledged_by"),
+                                        "resolved_at": incident.get("resolved_at"), "resolved_by": incident.get("resolved_by"),
+                                        "notification_mode": notification["mode"] if notification else None,
+                                        "notification_status": notification["status"] if notification else None,
+                                    },
+                                    "notification": ({
+                                        "id": notification["id"], "incident_id": notification["incident_id"],
+                                        "event_severity": notification["event_severity"], "mode": notification["mode"],
+                                        "status": notification["status"], "message": notification["message"],
+                                        "provider_message_id": notification["provider_message_id"],
+                                        "created_at": notification["created_at"], "zone_name": zone["name"],
+                                        "gas_name": incident["gas_name"], "reading": incident["reading"],
+                                        "unit": incident["unit"],
+                                    } if notification else None)})
         for zone_id in zone_ids:
             critical_simulation_last_trigger[zone_id] = now
         # Critical readings are intentionally latched and continue rising on
@@ -488,7 +538,7 @@ async def critical_simulation_for_zones(zone_ids: list[int], actor: str) -> list
     # Push the committed state to other connected dashboards immediately. The
     # initiating dashboard also applies the confirmed reading from this response.
     asyncio.create_task(broadcast())
-    return created
+    return api_json(created)
 
 
 @app.post("/api/simulation/critical")
@@ -509,28 +559,40 @@ async def change_incident(incident_id: str, actor: str, action: str):
     recovery_reading = None
     async with simulator_control_lock:
         async with require_pool().acquire() as conn:
-            async with conn.transaction():
-                row = await conn.fetchrow(f"UPDATE incidents SET {column}=COALESCE({column},now()),{column.replace('_at','_by')}=COALESCE({column.replace('_at','_by')},$2),state=$3 WHERE id=$1 AND state <> 'RESOLVED' RETURNING *", incident_id, actor, state)
-                if not row:
-                    exists = await conn.fetchval("SELECT 1 FROM incidents WHERE id=$1", incident_id)
-                    if not exists:
-                        raise HTTPException(404, "Incident not found")
-                    raise HTTPException(409, "Incident is already resolved")
-                await conn.execute("INSERT INTO audit_events(actor,action,entity_type,entity_id) VALUES($1,$2,'incident',$3)", actor, action.upper(), incident_id)
-                if action == "resolve" and row["severity"] == "CRITICAL":
-                    zone = await conn.fetchrow("SELECT id,unit,critical_threshold,normal_min,normal_max FROM zones WHERE id=$1 FOR UPDATE", row["zone_id"])
-                    if zone is None:
-                        raise HTTPException(404, "Incident zone not found")
-                    value = simulation_reading(zone, None)
-                    measured_at = datetime.now(timezone.utc)
-                    await conn.execute("INSERT INTO readings(zone_id,value,unit,measured_at) VALUES($1,$2,$3,$4)",
-                                       zone["id"], value, zone["unit"], measured_at)
-                    recovery_reading = {"zone_id": zone["id"], "reading": value, "unit": zone["unit"],
-                                        "status": "NORMAL", "measured_at": measured_at.isoformat()}
-                result = api_json(dict(row))
-                if recovery_reading:
-                    result["recovery_reading"] = recovery_reading
-                return result
+            row = await conn.fetchrow(f"""WITH changed AS (
+                UPDATE incidents SET {column}=COALESCE({column},now()),
+                    {column.replace('_at','_by')}=COALESCE({column.replace('_at','_by')},$2),state=$3
+                WHERE id=$1 AND state <> 'RESOLVED' RETURNING *
+                ), audited AS (
+                INSERT INTO audit_events(actor,action,entity_type,entity_id)
+                SELECT $2,$4,'incident',$1::text FROM changed RETURNING id
+                ), recovered AS (
+                INSERT INTO readings(zone_id,value,unit,measured_at)
+                SELECT z.id,ROUND(z.normal_min+random()::numeric*(z.normal_max-z.normal_min),3),z.unit,now()
+                FROM zones z JOIN changed i ON i.zone_id=z.id
+                WHERE $4='RESOLVE' AND i.severity='CRITICAL'
+                RETURNING zone_id,value,unit,measured_at
+                )
+                SELECT changed.*,recovered.value AS recovery_reading,
+                    recovered.unit AS recovery_unit,recovered.measured_at AS recovery_measured_at
+                FROM changed LEFT JOIN recovered ON recovered.zone_id=changed.zone_id""",
+                incident_id, actor, state, action.upper())
+            if not row:
+                exists = await conn.fetchval("SELECT 1 FROM incidents WHERE id=$1", incident_id)
+                if not exists:
+                    raise HTTPException(404, "Incident not found")
+                raise HTTPException(409, "Incident is already resolved")
+            row_data = dict(row)
+            value = row_data.pop("recovery_reading", None)
+            unit = row_data.pop("recovery_unit", None)
+            measured_at = row_data.pop("recovery_measured_at", None)
+            result = api_json(row_data)
+            if value is not None:
+                result["recovery_reading"] = api_json({
+                    "zone_id": row["zone_id"], "reading": value, "unit": unit,
+                    "status": "NORMAL", "measured_at": measured_at,
+                })
+            return result
 
 
 @app.post("/api/incidents/{incident_id}/acknowledge")
