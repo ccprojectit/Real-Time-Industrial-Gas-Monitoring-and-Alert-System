@@ -105,7 +105,7 @@ async def broadcast(zones=None):
         return
 
 
-async def save_critical_reading(conn, zone, value: float, *, measured_at=None):
+async def save_critical_reading(conn, zone, value: float, *, measured_at=None, actor=None):
     now = measured_at or datetime.now(timezone.utc)
     # Persist the reading and retire any unresolved legacy incident atomically
     # in one database round trip. Legacy rows remain in history.
@@ -121,21 +121,42 @@ async def save_critical_reading(conn, zone, value: float, *, measured_at=None):
         )
         INSERT INTO audit_events(actor,action,entity_type,entity_id)
         SELECT 'system','RETIRE_LEGACY_ALERT','incident',id FROM retired""", zone["id"], value, zone["unit"], now)
-    incident = await conn.fetchrow("""SELECT * FROM incidents WHERE zone_id=$1 AND severity='CRITICAL'
-        AND state <> 'RESOLVED' ORDER BY created_at DESC LIMIT 1 FOR UPDATE""", zone["id"])
-    is_new_incident = incident is None
-    if incident is None:
-        incident = await conn.fetchrow("""INSERT INTO incidents(zone_id,gas_name,formula,severity,reading,unit,
+    incident = await conn.fetchrow("""WITH active_incident AS (
+        SELECT * FROM incidents WHERE zone_id=$1 AND severity='CRITICAL' AND state <> 'RESOLVED'
+        ORDER BY created_at DESC LIMIT 1 FOR UPDATE
+        ), created_incident AS (
+        INSERT INTO incidents(zone_id,gas_name,formula,severity,reading,unit,
             warning_threshold_at_creation,critical_threshold_at_creation,threshold,created_at,critical_at,state)
-            VALUES($1,$2,$3,'CRITICAL',$4,$5,$6,$7,$7,$8,$8,'OPEN') RETURNING *""", zone["id"], zone["gas_name"], zone["formula"],
-            value, zone["unit"], zone["warning_threshold"], zone["critical_threshold"], now)
+        SELECT $1,$2,$3,'CRITICAL',$4,$5,$6,$7,$7,$8,$8,'OPEN'
+        WHERE NOT EXISTS (SELECT 1 FROM active_incident)
+        ON CONFLICT (zone_id) WHERE state <> 'RESOLVED' DO NOTHING
+        RETURNING *
+        ), selected_incident AS (
+        SELECT * FROM created_incident
+        UNION ALL
+        SELECT * FROM active_incident WHERE NOT EXISTS (SELECT 1 FROM created_incident)
+        ), audited AS (
+        INSERT INTO audit_events(actor,action,entity_type,entity_id)
+        SELECT $9,'CRITICAL_SIMULATION','zone',$1::text FROM selected_incident
+        WHERE $9 IS NOT NULL RETURNING id
+        )
+        SELECT selected_incident.*,(EXISTS(SELECT 1 FROM created_incident)) AS created_new
+        FROM selected_incident LIMIT 1""", zone["id"], zone["gas_name"], zone["formula"], value,
+        zone["unit"], zone["warning_threshold"], zone["critical_threshold"], now, actor)
+    if incident is None:
+        # Covers a concurrent insert from another backend process racing the
+        # unique active-incident index; normal operation is serialized above.
+        incident = await conn.fetchrow("SELECT *,false AS created_new FROM incidents WHERE zone_id=$1 AND severity='CRITICAL' AND state <> 'RESOLVED' ORDER BY created_at DESC LIMIT 1 FOR UPDATE", zone["id"])
+    is_new_incident = bool(incident["created_new"])
+    incident_data = dict(incident)
+    incident_data.pop("created_new", None)
     if is_new_incident:
-        notification = await notify_incident(conn, {**dict(incident), "zone_name": zone["name"]})
+        notification = await notify_incident(conn, {**incident_data, "zone_name": zone["name"]})
     else:
         notification = await conn.fetchrow(
             "SELECT id::text AS id,incident_id::text AS incident_id,event_severity,mode,status,message,provider_message_id,created_at "
             "FROM notifications WHERE incident_id=$1 AND event_severity='CRITICAL'", incident["id"])
-    return {"incident": dict(incident), "notification": dict(notification) if notification else None}
+    return {"incident": incident_data, "notification": dict(notification) if notification else None}
 
 
 def simulation_reading(zone, prior: float | None) -> float:
@@ -496,11 +517,7 @@ async def critical_simulation_for_zones(zone_ids: list[int], actor: str) -> list
                     zone = zones_by_id[zone_id]
                     threshold = float(zone["critical_threshold"])
                     value = round(max(threshold * 1.08, threshold + 0.001), 3)
-                    record = await save_critical_reading(conn, zone, value, measured_at=measured_at)
-                    await conn.execute(
-                        "INSERT INTO audit_events(actor,action,entity_type,entity_id) VALUES($1,'CRITICAL_SIMULATION','zone',$2)",
-                        actor, str(zone["id"]),
-                    )
+                    record = await save_critical_reading(conn, zone, value, measured_at=measured_at, actor=actor)
                     incident = record["incident"]
                     notification = record["notification"]
                     created.append({"zone_id": zone_id, "reading": value, "status": "CRITICAL",

@@ -55,6 +55,19 @@ class MemoryConnection:
 
     async def fetchrow(self, sql, *args):
         self.executed.append((sql, args))
+        if "WITH active_incident AS" in sql:
+            if self.active and self.active.get("severity") == "CRITICAL" and self.active.get("state") != "RESOLVED":
+                return {**self.active, "created_new": False}
+            self.active = {
+                "id": f"incident-{len(self.created) + 1}", "severity": "CRITICAL",
+                "reading": args[3], "unit": args[4], "warning_threshold_at_creation": args[5],
+                "critical_threshold_at_creation": args[6], "threshold": args[6],
+                "created_at": args[7], "critical_at": args[7], "gas_name": args[1],
+                "formula":args[2],"zone_id":args[0],"state":"OPEN","acknowledged_at":None,
+                "acknowledged_by":None,"resolved_at":None,"resolved_by":None,"created_new":True,
+            }
+            self.created.append(self.active)
+            return self.active
         if "UPDATE incidents SET state='RESOLVED'" in sql:
             return None
         if "FROM notifications" in sql:
@@ -109,6 +122,18 @@ class CriticalBatchConnection:
         raise AssertionError(sql)
 
     async def fetchrow(self, sql, *args):
+        if "WITH active_incident AS" in sql:
+            active = next((i for i in self.incidents if i["zone_id"]==args[0] and i["severity"]=="CRITICAL" and i["state"]!="RESOLVED"),None)
+            if active:
+                return {**active,"created_new":False}
+            incident={"id":f"incident-{len(self.incidents)+1}","zone_id":args[0],"gas_name":args[1],"formula":args[2],
+                "severity":"CRITICAL","reading":args[3],"unit":args[4],"warning_threshold_at_creation":args[5],
+                "critical_threshold_at_creation":args[6],"threshold":args[6],"created_at":args[7],"critical_at":args[7],"state":"OPEN",
+                "acknowledged_at":None,"acknowledged_by":None,"resolved_at":None,"resolved_by":None,"created_new":True}
+            self.incidents.append(incident)
+            if args[8] is not None:
+                self.audit.append(("CRITICAL_SIMULATION",args[8],args[0]))
+            return incident
         if "UPDATE incidents SET state='RESOLVED'" in sql:
             return None
         if "FROM notifications" in sql:
